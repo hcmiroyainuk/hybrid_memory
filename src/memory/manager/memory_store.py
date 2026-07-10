@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
-from src.memory.entities import (
+from ..entities import (
     MemoryItem,
     MemoryScope,
     MemoryStatus,
@@ -22,9 +24,10 @@ class MemoryAlreadyExistsError(Exception):
 
 class MemoryStore:
     """
-    In-memory CRUD store for MemoryItem.
+    JSON-backed CRUD store for MemoryItem.
 
-    This store is intentionally kept simple.
+    This store persists memory current states into a JSON file.
+
     It does not handle:
     - permission checks
     - promotion workflow
@@ -35,8 +38,68 @@ class MemoryStore:
     Those responsibilities belong to service or retrieval layers.
     """
 
-    def __init__(self) -> None:
-        self._memories: dict[str, MemoryItem] = {}
+    def __init__(self, file_path: str | Path = "data/memories.json") -> None:
+        self.file_path = Path(file_path)
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not self.file_path.exists():
+            self._write_raw([])
+
+    # -------------------------
+    # Internal file operations
+    # -------------------------
+
+    def _read_raw(self) -> list[dict]:
+        """
+        Read raw memory records from the JSON file.
+        """
+        try:
+            with self.file_path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except json.JSONDecodeError:
+            raise ValueError(
+                f"Memory file '{self.file_path}' contains invalid JSON."
+            )
+
+        if not isinstance(data, list):
+            raise ValueError(
+                f"Memory file '{self.file_path}' must contain a JSON list."
+            )
+
+        return data
+
+    def _write_raw(self, data: list[dict]) -> None:
+        """
+        Write raw memory records to the JSON file.
+        """
+        with self.file_path.open("w", encoding="utf-8") as file:
+            json.dump(
+                data,
+                file,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+
+    def _load_memories(self) -> list[MemoryItem]:
+        """
+        Load all memory records as MemoryItem objects.
+        """
+        raw_memories = self._read_raw()
+        return [
+            MemoryItem.model_validate(memory)
+            for memory in raw_memories
+        ]
+
+    def _save_memories(self, memories: list[MemoryItem]) -> None:
+        """
+        Save MemoryItem objects into the JSON file.
+        """
+        raw_memories = [
+            memory.model_dump(mode="json")
+            for memory in memories
+        ]
+        self._write_raw(raw_memories)
 
     # -------------------------
     # Create
@@ -47,14 +110,19 @@ class MemoryStore:
         Save a new memory item.
 
         Raises:
-            MemoryAlreadyExistsError: if memory_id already exists.
+            MemoryAlreadyExistsError:
+                If memory_id already exists.
         """
-        if memory.memory_id in self._memories:
+        memories = self._load_memories()
+
+        if any(existing.memory_id == memory.memory_id for existing in memories):
             raise MemoryAlreadyExistsError(
                 f"Memory with id '{memory.memory_id}' already exists."
             )
 
-        self._memories[memory.memory_id] = deepcopy(memory)
+        memories.append(deepcopy(memory))
+        self._save_memories(memories)
+
         return deepcopy(memory)
 
     # -------------------------
@@ -66,20 +134,23 @@ class MemoryStore:
         Get a memory by its ID.
 
         Raises:
-            MemoryNotFoundError: if memory does not exist.
+            MemoryNotFoundError:
+                If memory does not exist.
         """
-        memory = self._memories.get(memory_id)
+        memories = self._load_memories()
 
-        if memory is None:
-            raise MemoryNotFoundError(f"Memory with id '{memory_id}' was not found.")
+        for memory in memories:
+            if memory.memory_id == memory_id:
+                return deepcopy(memory)
 
-        return deepcopy(memory)
+        raise MemoryNotFoundError(f"Memory with id '{memory_id}' was not found.")
 
     def exists(self, memory_id: str) -> bool:
         """
         Check whether a memory exists.
         """
-        return memory_id in self._memories
+        memories = self._load_memories()
+        return any(memory.memory_id == memory_id for memory in memories)
 
     def list_all(self, include_deprecated: bool = True) -> list[MemoryItem]:
         """
@@ -89,7 +160,7 @@ class MemoryStore:
             include_deprecated:
                 If False, deprecated memories are excluded.
         """
-        memories = list(self._memories.values())
+        memories = self._load_memories()
 
         if not include_deprecated:
             memories = [
@@ -111,10 +182,11 @@ class MemoryStore:
         Return memories with the given lifecycle status.
         """
         status = MemoryStatus(status)
+        memories = self._load_memories()
 
         result = [
             memory
-            for memory in self._memories.values()
+            for memory in memories
             if memory.metadata.status == status
         ]
 
@@ -129,10 +201,11 @@ class MemoryStore:
         Return memories by scope: private or shared.
         """
         scope = MemoryScope(scope)
+        memories = self._load_memories()
 
         result = [
             memory
-            for memory in self._memories.values()
+            for memory in memories
             if memory.metadata.scope == scope
         ]
 
@@ -165,9 +238,11 @@ class MemoryStore:
         """
         Return private memories owned by a specific agent.
         """
+        memories = self._load_memories()
+
         result = [
             memory
-            for memory in self._memories.values()
+            for memory in memories
             if memory.metadata.scope == MemoryScope.PRIVATE
             and memory.metadata.owner_agent_id == agent_id
         ]
@@ -189,9 +264,11 @@ class MemoryStore:
         """
         Return memories currently owned by an agent.
         """
+        memories = self._load_memories()
+
         result = [
             memory
-            for memory in self._memories.values()
+            for memory in memories
             if memory.metadata.owner_agent_id == owner_agent_id
         ]
 
@@ -212,9 +289,11 @@ class MemoryStore:
         """
         Return memories originally created by an agent.
         """
+        memories = self._load_memories()
+
         result = [
             memory
-            for memory in self._memories.values()
+            for memory in memories
             if memory.metadata.created_by_agent_id == created_by_agent_id
         ]
 
@@ -236,10 +315,11 @@ class MemoryStore:
         Return memories by lightweight memory type.
         """
         memory_type = MemoryType(memory_type)
+        memories = self._load_memories()
 
         result = [
             memory
-            for memory in self._memories.values()
+            for memory in memories
             if memory.metadata.memory_type == memory_type
         ]
 
@@ -273,11 +353,12 @@ class MemoryStore:
         if not tags:
             return self.list_active() if active_only else self.list_all()
 
+        memories = self._load_memories()
         query_tags = set(tags)
 
         result = []
 
-        for memory in self._memories.values():
+        for memory in memories:
             memory_tags = set(memory.metadata.tags)
 
             if match_all:
@@ -316,7 +397,7 @@ class MemoryStore:
         This is structured filtering, not semantic retrieval.
         RAG / similarity search should be implemented in a retriever layer.
         """
-        result = list(self._memories.values())
+        result = self._load_memories()
 
         if scope is not None:
             scope = MemoryScope(scope)
@@ -399,14 +480,18 @@ class MemoryStore:
         This is a low-level method.
         Business-level update logic should be handled in MemoryService.
         """
-        if memory.memory_id not in self._memories:
-            raise MemoryNotFoundError(
-                f"Memory with id '{memory.memory_id}' was not found."
-            )
+        memories = self._load_memories()
 
-        memory.metadata.updated_at = datetime.now(timezone.utc)
-        self._memories[memory.memory_id] = deepcopy(memory)
-        return deepcopy(memory)
+        for index, existing in enumerate(memories):
+            if existing.memory_id == memory.memory_id:
+                memory.metadata.updated_at = datetime.now(timezone.utc)
+                memories[index] = deepcopy(memory)
+                self._save_memories(memories)
+                return deepcopy(memory)
+
+        raise MemoryNotFoundError(
+            f"Memory with id '{memory.memory_id}' was not found."
+        )
 
     def update_content(
         self,
@@ -431,9 +516,8 @@ class MemoryStore:
             memory.summary = summary
 
         memory.metadata.updated_at = datetime.now(timezone.utc)
-        self._memories[memory_id] = deepcopy(memory)
 
-        return deepcopy(memory)
+        return self.replace(memory)
 
     def update_metadata(
         self,
@@ -476,9 +560,8 @@ class MemoryStore:
             memory.metadata.source_message_ids = list(dict.fromkeys(source_message_ids))
 
         memory.metadata.updated_at = datetime.now(timezone.utc)
-        self._memories[memory_id] = deepcopy(memory)
 
-        return deepcopy(memory)
+        return self.replace(memory)
 
     def update_status(
         self,
@@ -499,8 +582,7 @@ class MemoryStore:
             if operation_id not in memory.metadata.related_operation_ids:
                 memory.metadata.related_operation_ids.append(operation_id)
 
-        self._memories[memory_id] = deepcopy(memory)
-        return deepcopy(memory)
+        return self.replace(memory)
 
     def update_access(
         self,
@@ -527,9 +609,8 @@ class MemoryStore:
             memory.metadata.writable_by = list(dict.fromkeys(writable_by))
 
         memory.metadata.updated_at = datetime.now(timezone.utc)
-        self._memories[memory_id] = deepcopy(memory)
 
-        return deepcopy(memory)
+        return self.replace(memory)
 
     def update_scope(
         self,
@@ -560,9 +641,8 @@ class MemoryStore:
             memory.metadata.writable_by = list(dict.fromkeys(writable_by))
 
         memory.metadata.updated_at = datetime.now(timezone.utc)
-        self._memories[memory_id] = deepcopy(memory)
 
-        return deepcopy(memory)
+        return self.replace(memory)
 
     # -------------------------
     # Delete
@@ -591,10 +671,18 @@ class MemoryStore:
         This should only be used for tests or development reset.
         Formal business logic should use deprecate().
         """
-        if memory_id not in self._memories:
+        memories = self._load_memories()
+
+        new_memories = [
+            memory
+            for memory in memories
+            if memory.memory_id != memory_id
+        ]
+
+        if len(new_memories) == len(memories):
             raise MemoryNotFoundError(f"Memory with id '{memory_id}' was not found.")
 
-        del self._memories[memory_id]
+        self._save_memories(new_memories)
 
     def clear(self) -> None:
         """
@@ -602,7 +690,7 @@ class MemoryStore:
 
         Intended for testing or demo reset.
         """
-        self._memories.clear()
+        self._write_raw([])
 
     # -------------------------
     # Utility
@@ -612,4 +700,15 @@ class MemoryStore:
         """
         Return the total number of stored memories.
         """
-        return len(self._memories)
+        return len(self._load_memories())
+
+    def export_as_dicts(self) -> list[dict]:
+        """
+        Export all memories as plain dictionaries.
+
+        Useful for debugging, tests, or displaying JSON data.
+        """
+        return [
+            memory.model_dump(mode="json")
+            for memory in self._load_memories()
+        ]

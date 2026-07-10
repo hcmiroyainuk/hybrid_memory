@@ -3,7 +3,8 @@ from src.memory.manager import MemoryStore
 from src.memory.entities import Agent
 
 
-store = MemoryStore()
+store = MemoryStore(file_path="data/test_memories.json")
+store.clear()
 
 worker = Agent.worker(agent_id="agent_worker_a", name="Worker A")
 
