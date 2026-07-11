@@ -35,7 +35,7 @@ class MemoryStore:
     - operation logging
     - RAG / vector retrieval
 
-    Those responsibilities belong to service or retrieval layers.
+    Those responsibilities belong to services or retrieval layers.
     """
 
     def __init__(self, file_path: str | Path = "data/memories.json") -> None:
@@ -533,7 +533,7 @@ class MemoryStore:
         """
         Update non-access metadata fields.
 
-        Access and scope changes should be handled by dedicated service methods.
+        Access and scope changes should be handled by dedicated services methods.
         """
         memory = self.get_by_id(memory_id)
 
@@ -595,7 +595,7 @@ class MemoryStore:
         """
         Update access-related metadata.
 
-        This is low-level. Permission checks should be done in the service layer.
+        This is low-level. Permission checks should be done in the services layer.
         """
         memory = self.get_by_id(memory_id)
 
