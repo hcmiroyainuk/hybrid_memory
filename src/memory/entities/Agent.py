@@ -45,10 +45,10 @@ class Agent(BaseModel):
     )
 
     @classmethod
-    def coordinator(cls, agent_id: str = "agent_coordinator") -> "Agent":
+    def coordinator(cls, agent_id: str = "agent_coordinator", name: Optional[str] = None) -> "Agent":
         return cls(
             agent_id=agent_id,
-            name="Coordinator Agent",
+            name=name or agent_id,
             role=AgentRole.COORDINATOR,
             can_read_shared=True,
             can_write_private=True,
@@ -58,10 +58,10 @@ class Agent(BaseModel):
         )
 
     @classmethod
-    def critic(cls, agent_id: str = "agent_critic") -> "Agent":
+    def critic(cls, agent_id: str = "agent_critic", name: Optional[str] = None) -> "Agent":
         return cls(
             agent_id=agent_id,
-            name="Critic Agent",
+            name=name or agent_id,
             role=AgentRole.CRITIC,
             can_read_shared=True,
             can_write_private=True,
