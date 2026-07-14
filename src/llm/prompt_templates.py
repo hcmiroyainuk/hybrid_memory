@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import json
-from typing import Iterable
 
 from src.memory.external_knowledge import RetrievedKnowledge
-from .output_schemas import AgentAnswer, CriticOutput, CoordinatorOutput
+from .output_schemas import AgentAnswer, CriticOutput
 
 
 class PromptTemplates:
@@ -19,6 +18,9 @@ class PromptTemplates:
 
     This module only builds prompts.
     It does not call LLMs or parse outputs.
+
+    accessible_memory_context is permission-filtered memory context.
+    It must be prepared before prompt construction by GovernedContextBuilder.
     """
 
     # ------------------------------------------------------------------
@@ -26,20 +28,33 @@ class PromptTemplates:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def build_worker_a_prompt(question: str) -> str:
+    def build_worker_a_prompt(
+        question: str,
+        accessible_memory_context: str | None = None,
+    ) -> str:
         """
         Build prompt for Worker A.
 
-        Worker A answers using parametric model knowledge only.
+        Worker A answers using parametric model knowledge and optional
+        permission-filtered accessible memory.
+
+        Worker A does not use external retrieved evidence.
         """
+
+        memory_text = PromptTemplates.format_accessible_memory_context(
+            accessible_memory_context
+        )
 
         return f"""
 You are Worker A, a direct question-answering agent.
 
 Your task:
-Answer the question using your own knowledge.
+Answer the question using your own knowledge and the accessible memory if it is relevant.
 
 Important rules:
+- You may use accessible memory only if it helps answer the question.
+- The accessible memory has already been permission-filtered by the system.
+- Do not infer or request memories that are not shown.
 - Return a short answer span.
 - Do not return a full sentence unless necessary.
 - Do not include explanation in the answer field.
@@ -49,6 +64,9 @@ Important rules:
 
 Question:
 {question}
+
+Accessible memory:
+{memory_text}
 
 Required output schema:
 {PromptTemplates._schema_hint_for_agent_answer()}
@@ -62,13 +80,18 @@ Required output schema:
     def build_worker_b_prompt(
         question: str,
         retrieved_knowledge: list[RetrievedKnowledge],
+        accessible_memory_context: str | None = None,
     ) -> str:
         """
         Build prompt for Worker B.
 
-        Worker B answers using retrieved external evidence.
+        Worker B answers using retrieved external evidence and optional
+        permission-filtered accessible memory.
         """
 
+        memory_text = PromptTemplates.format_accessible_memory_context(
+            accessible_memory_context
+        )
         evidence_text = PromptTemplates.format_retrieved_knowledge(
             retrieved_knowledge
         )
@@ -77,10 +100,13 @@ Required output schema:
 You are Worker B, a retrieval-grounded question-answering agent.
 
 Your task:
-Answer the question using the retrieved evidence.
+Answer the question using the retrieved evidence and the accessible memory if relevant.
 
 Important rules:
 - Prefer answers directly supported by the retrieved evidence.
+- You may use accessible memory only if it is relevant.
+- The accessible memory has already been permission-filtered by the system.
+- Do not infer or request memories that are not shown.
 - Return a short answer span.
 - Do not return a full sentence unless necessary.
 - Do not include explanation in the answer field.
@@ -91,6 +117,9 @@ Important rules:
 
 Question:
 {question}
+
+Accessible memory:
+{memory_text}
 
 Retrieved evidence:
 {evidence_text}
@@ -109,13 +138,18 @@ Required output schema:
         worker_a_output: AgentAnswer,
         worker_b_output: AgentAnswer,
         retrieved_knowledge: list[RetrievedKnowledge],
+        accessible_memory_context: str | None = None,
     ) -> str:
         """
         Build prompt for the Critic.
 
         The Critic compares Worker A and Worker B and recommends one answer.
+        It may also use permission-filtered accessible memory as supporting context.
         """
 
+        memory_text = PromptTemplates.format_accessible_memory_context(
+            accessible_memory_context
+        )
         evidence_text = PromptTemplates.format_retrieved_knowledge(
             retrieved_knowledge
         )
@@ -138,9 +172,13 @@ Compare Worker A and Worker B, evaluate their answers, and recommend the most li
 
 Important rules:
 - Check whether Worker B's answer is supported by the retrieved evidence.
+- Use accessible memory only if it is relevant to the question or to answer validation.
+- The accessible memory has already been permission-filtered by the system.
+- Do not infer or request memories that are not shown.
 - Do not blindly prefer Worker B.
 - Prefer Worker B only if the evidence is relevant and supports the answer.
 - If the retrieved evidence is irrelevant or insufficient, prefer the more plausible answer.
+- If accessible memory conflicts with worker outputs or evidence, mention the conflict in comment.
 - If both answers are weak, still recommend the best possible short answer.
 - recommended_answer must be a short answer span.
 - Do not include explanation in recommended_answer.
@@ -149,6 +187,9 @@ Important rules:
 
 Question:
 {question}
+
+Accessible memory:
+{memory_text}
 
 Worker outputs:
 {worker_a_text}
@@ -173,13 +214,18 @@ Required output schema:
         worker_b_output: AgentAnswer,
         critic_output: CriticOutput,
         retrieved_knowledge: list[RetrievedKnowledge],
+        accessible_memory_context: str | None = None,
     ) -> str:
         """
         Build prompt for the Coordinator.
 
         The Coordinator produces the final answer used for evaluation.
+        It may use permission-filtered accessible memory as additional context.
         """
 
+        memory_text = PromptTemplates.format_accessible_memory_context(
+            accessible_memory_context
+        )
         evidence_text = PromptTemplates.format_retrieved_knowledge(
             retrieved_knowledge
         )
@@ -204,6 +250,7 @@ Produce the final answer for evaluation.
 
 You are given:
 - The original question
+- Permission-filtered accessible memory
 - Worker A's direct answer
 - Worker B's retrieval-grounded answer
 - The retrieved evidence
@@ -211,7 +258,11 @@ You are given:
 
 Important rules:
 - Use all available information.
+- Use accessible memory only if it is relevant.
+- The accessible memory has already been permission-filtered by the system.
+- Do not infer or request memories that are not shown.
 - Prefer evidence-supported answers when the retrieved evidence is relevant.
+- If accessible memory conflicts with evidence or worker outputs, reason carefully.
 - Do not blindly follow any single worker.
 - final_answer must be one short answer span.
 - Do not include explanation in final_answer.
@@ -220,6 +271,9 @@ Important rules:
 
 Question:
 {question}
+
+Accessible memory:
+{memory_text}
 
 Worker outputs:
 {worker_a_text}
@@ -239,6 +293,26 @@ Required output schema:
     # ------------------------------------------------------------------
     # Formatting helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def format_accessible_memory_context(
+        accessible_memory_context: str | None,
+    ) -> str:
+        """
+        Format accessible memory context for prompt input.
+
+        The input should already be permission-filtered.
+        """
+
+        if accessible_memory_context is None:
+            return "No accessible memory."
+
+        text = str(accessible_memory_context).strip()
+
+        if not text:
+            return "No accessible memory."
+
+        return text
 
     @staticmethod
     def format_retrieved_knowledge(
@@ -333,9 +407,6 @@ Required output schema:
     def _schema_hint_for_agent_answer() -> str:
         """
         Human-readable JSON schema hint for AgentAnswer.
-
-        This is included in prompts even when structured output is used,
-        because it helps the model follow the expected shape.
         """
 
         return json.dumps(
@@ -389,17 +460,25 @@ Required output schema:
 # Optional functional wrappers
 # ----------------------------------------------------------------------
 
-def build_worker_a_prompt(question: str) -> str:
-    return PromptTemplates.build_worker_a_prompt(question)
+def build_worker_a_prompt(
+    question: str,
+    accessible_memory_context: str | None = None,
+) -> str:
+    return PromptTemplates.build_worker_a_prompt(
+        question=question,
+        accessible_memory_context=accessible_memory_context,
+    )
 
 
 def build_worker_b_prompt(
     question: str,
     retrieved_knowledge: list[RetrievedKnowledge],
+    accessible_memory_context: str | None = None,
 ) -> str:
     return PromptTemplates.build_worker_b_prompt(
         question=question,
         retrieved_knowledge=retrieved_knowledge,
+        accessible_memory_context=accessible_memory_context,
     )
 
 
@@ -408,12 +487,14 @@ def build_critic_prompt(
     worker_a_output: AgentAnswer,
     worker_b_output: AgentAnswer,
     retrieved_knowledge: list[RetrievedKnowledge],
+    accessible_memory_context: str | None = None,
 ) -> str:
     return PromptTemplates.build_critic_prompt(
         question=question,
         worker_a_output=worker_a_output,
         worker_b_output=worker_b_output,
         retrieved_knowledge=retrieved_knowledge,
+        accessible_memory_context=accessible_memory_context,
     )
 
 
@@ -423,6 +504,7 @@ def build_coordinator_prompt(
     worker_b_output: AgentAnswer,
     critic_output: CriticOutput,
     retrieved_knowledge: list[RetrievedKnowledge],
+    accessible_memory_context: str | None = None,
 ) -> str:
     return PromptTemplates.build_coordinator_prompt(
         question=question,
@@ -430,4 +512,5 @@ def build_coordinator_prompt(
         worker_b_output=worker_b_output,
         critic_output=critic_output,
         retrieved_knowledge=retrieved_knowledge,
+        accessible_memory_context=accessible_memory_context,
     )

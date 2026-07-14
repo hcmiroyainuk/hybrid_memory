@@ -32,10 +32,15 @@ class LLMClient:
     - return structured Pydantic outputs
 
     Agents:
-    - Worker A: direct parametric QA
+    - Worker A: direct QA
     - Worker B: retrieval-grounded QA
     - Critic: compare Worker A and Worker B
     - Coordinator: final answer generation
+
+    accessible_memory_context:
+    - optional permission-filtered memory context
+    - should be prepared by GovernedContextBuilder
+    - this client does not perform permission checking
     """
 
     def __init__(
@@ -75,17 +80,23 @@ class LLMClient:
     def generate_worker_a_answer(
         self,
         question: str,
+        accessible_memory_context: str | None = None,
     ) -> AgentAnswer:
         """
         Generate Worker A's direct answer.
 
-        Worker A only receives the question and does not use retrieved evidence.
+        Worker A receives:
+        - question
+        - optional permission-filtered accessible memory
+
+        Worker A does not receive external retrieved evidence.
         """
 
         self._validate_question(question)
 
         prompt = PromptTemplates.build_worker_a_prompt(
             question=question,
+            accessible_memory_context=accessible_memory_context,
         )
 
         output = self.agent_answer_model.invoke(prompt)
@@ -103,11 +114,15 @@ class LLMClient:
         self,
         question: str,
         retrieved_knowledge: list[RetrievedKnowledge],
+        accessible_memory_context: str | None = None,
     ) -> AgentAnswer:
         """
         Generate Worker B's retrieval-grounded answer.
 
-        Worker B receives the question and retrieved external knowledge chunks.
+        Worker B receives:
+        - question
+        - retrieved external knowledge
+        - optional permission-filtered accessible memory
         """
 
         self._validate_question(question)
@@ -115,6 +130,7 @@ class LLMClient:
         prompt = PromptTemplates.build_worker_b_prompt(
             question=question,
             retrieved_knowledge=retrieved_knowledge,
+            accessible_memory_context=accessible_memory_context,
         )
 
         output = self.agent_answer_model.invoke(prompt)
@@ -134,9 +150,17 @@ class LLMClient:
         worker_a_output: AgentAnswer,
         worker_b_output: AgentAnswer,
         retrieved_knowledge: list[RetrievedKnowledge],
+        accessible_memory_context: str | None = None,
     ) -> CriticOutput:
         """
         Generate Critic's comparison and recommendation.
+
+        Critic receives:
+        - question
+        - Worker A output
+        - Worker B output
+        - retrieved external knowledge
+        - optional permission-filtered accessible memory
         """
 
         self._validate_question(question)
@@ -146,6 +170,7 @@ class LLMClient:
             worker_a_output=worker_a_output,
             worker_b_output=worker_b_output,
             retrieved_knowledge=retrieved_knowledge,
+            accessible_memory_context=accessible_memory_context,
         )
 
         output = self.critic_output_model.invoke(prompt)
@@ -166,9 +191,18 @@ class LLMClient:
         worker_b_output: AgentAnswer,
         critic_output: CriticOutput,
         retrieved_knowledge: list[RetrievedKnowledge],
+        accessible_memory_context: str | None = None,
     ) -> CoordinatorOutput:
         """
         Generate Coordinator's final answer.
+
+        Coordinator receives:
+        - question
+        - Worker A output
+        - Worker B output
+        - Critic output
+        - retrieved external knowledge
+        - optional permission-filtered accessible memory
 
         final_answer is the answer used later for SQuAD EM / F1 evaluation.
         """
@@ -181,6 +215,7 @@ class LLMClient:
             worker_b_output=worker_b_output,
             critic_output=critic_output,
             retrieved_knowledge=retrieved_knowledge,
+            accessible_memory_context=accessible_memory_context,
         )
 
         output = self.coordinator_output_model.invoke(prompt)
@@ -198,20 +233,31 @@ class LLMClient:
         self,
         question: str,
         retrieved_knowledge: list[RetrievedKnowledge],
+        worker_a_memory_context: str | None = None,
+        worker_b_memory_context: str | None = None,
+        critic_memory_context: str | None = None,
+        coordinator_memory_context: str | None = None,
     ) -> dict:
         """
         Run Worker A, Worker B, Critic, and Coordinator in sequence.
 
-        This is useful for quick testing before building the LangGraph workflow.
+        This helper supports both:
+        - standard RAG QA baseline
+        - governed memory RAG QA baseline
+
+        For standard baseline, leave all memory context arguments as None.
+        For governed baseline, pass permission-filtered memory contexts.
         """
 
         worker_a_output = self.generate_worker_a_answer(
             question=question,
+            accessible_memory_context=worker_a_memory_context,
         )
 
         worker_b_output = self.generate_worker_b_answer(
             question=question,
             retrieved_knowledge=retrieved_knowledge,
+            accessible_memory_context=worker_b_memory_context,
         )
 
         critic_output = self.generate_critic_output(
@@ -219,6 +265,7 @@ class LLMClient:
             worker_a_output=worker_a_output,
             worker_b_output=worker_b_output,
             retrieved_knowledge=retrieved_knowledge,
+            accessible_memory_context=critic_memory_context,
         )
 
         coordinator_output = self.generate_coordinator_output(
@@ -227,6 +274,7 @@ class LLMClient:
             worker_b_output=worker_b_output,
             critic_output=critic_output,
             retrieved_knowledge=retrieved_knowledge,
+            accessible_memory_context=coordinator_memory_context,
         )
 
         return {
@@ -243,17 +291,22 @@ class LLMClient:
     def build_worker_a_prompt_preview(
         self,
         question: str,
+        accessible_memory_context: str | None = None,
     ) -> str:
         """
         Return Worker A prompt without calling the LLM.
         """
 
-        return PromptTemplates.build_worker_a_prompt(question)
+        return PromptTemplates.build_worker_a_prompt(
+            question=question,
+            accessible_memory_context=accessible_memory_context,
+        )
 
     def build_worker_b_prompt_preview(
         self,
         question: str,
         retrieved_knowledge: list[RetrievedKnowledge],
+        accessible_memory_context: str | None = None,
     ) -> str:
         """
         Return Worker B prompt without calling the LLM.
@@ -262,6 +315,49 @@ class LLMClient:
         return PromptTemplates.build_worker_b_prompt(
             question=question,
             retrieved_knowledge=retrieved_knowledge,
+            accessible_memory_context=accessible_memory_context,
+        )
+
+    def build_critic_prompt_preview(
+        self,
+        question: str,
+        worker_a_output: AgentAnswer,
+        worker_b_output: AgentAnswer,
+        retrieved_knowledge: list[RetrievedKnowledge],
+        accessible_memory_context: str | None = None,
+    ) -> str:
+        """
+        Return Critic prompt without calling the LLM.
+        """
+
+        return PromptTemplates.build_critic_prompt(
+            question=question,
+            worker_a_output=worker_a_output,
+            worker_b_output=worker_b_output,
+            retrieved_knowledge=retrieved_knowledge,
+            accessible_memory_context=accessible_memory_context,
+        )
+
+    def build_coordinator_prompt_preview(
+        self,
+        question: str,
+        worker_a_output: AgentAnswer,
+        worker_b_output: AgentAnswer,
+        critic_output: CriticOutput,
+        retrieved_knowledge: list[RetrievedKnowledge],
+        accessible_memory_context: str | None = None,
+    ) -> str:
+        """
+        Return Coordinator prompt without calling the LLM.
+        """
+
+        return PromptTemplates.build_coordinator_prompt(
+            question=question,
+            worker_a_output=worker_a_output,
+            worker_b_output=worker_b_output,
+            critic_output=critic_output,
+            retrieved_knowledge=retrieved_knowledge,
+            accessible_memory_context=accessible_memory_context,
         )
 
     # ------------------------------------------------------------------
