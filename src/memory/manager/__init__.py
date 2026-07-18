@@ -10,6 +10,12 @@ from .operation_log_store import (
     OperationLogAlreadyExistsError,
 )
 
+from .promotion_request_store import (
+    PromotionRequestStore,
+    PromotionRequestNotFoundError,
+    PromotionRequestAlreadyExistsError,
+)
+
 __all__ = [
     "MemoryStore",
     "MemoryNotFoundError",
@@ -17,4 +23,7 @@ __all__ = [
     "OperationLogStore",
     "OperationLogNotFoundError",
     "OperationLogAlreadyExistsError",
+    "PromotionRequestStore",
+    "PromotionRequestNotFoundError",
+    "PromotionRequestAlreadyExistsError",
 ]

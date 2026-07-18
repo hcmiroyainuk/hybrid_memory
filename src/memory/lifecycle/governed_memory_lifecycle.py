@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from ..entities import Agent, MemoryItem
+from ..services.operation_log_service import OperationLogService
 from .candidate_memory_builder import CandidateMemoryBuilder
 from .conflict_detector import ConflictDetector
+from ..entities import (
+    Agent,
+    MemoryItem,
+    ConflictType as OperationConflictType,
+)
 from .conflict_schema import (
     ConflictCheckResult,
+    ConflictType as LifecycleConflictType,
     GovernedMemoryLifecycleResult,
 )
 from .memory_write_controller import (
@@ -39,6 +45,20 @@ class GovernedMemoryLifecycle:
     - low-level storage
     - promotion business rules
     """
+
+    CONFLICT_TYPE_MAP: dict[
+        LifecycleConflictType,
+        OperationConflictType,
+    ] = {
+        LifecycleConflictType.DUPLICATE:
+            OperationConflictType.DUPLICATION,
+
+        LifecycleConflictType.CONFLICTING_ANSWER:
+            OperationConflictType.CONTRADICTION,
+
+        LifecycleConflictType.OUTDATED:
+            OperationConflictType.OUTDATED,
+    }
 
     def __init__(
             self,
@@ -88,7 +108,7 @@ class GovernedMemoryLifecycle:
         Returns:
             GovernedMemoryLifecycleResult.
         """
-
+        log_count_before = self._count_operation_logs()
         candidate_memory: Optional[MemoryItem] = None
         conflict_result: Optional[ConflictCheckResult] = None
         write_result: Optional[MemoryWriteResult] = None
@@ -137,11 +157,22 @@ class GovernedMemoryLifecycle:
                     candidate_memory=candidate_memory,
                     conflict_result=conflict_result,
                     write_result=write_result,
+                    log_count_before=log_count_before,
                     message=write_result.message,
                 )
 
-            # Duplicate candidate: successfully blocked.
+            # Duplicate candidate: log conflict and block persistence.
             if not write_result.written:
+                if (
+                        conflict_result.conflict_type
+                        == LifecycleConflictType.DUPLICATE
+                ):
+                    self._record_detected_conflicts(
+                        subject_memory=candidate_memory,
+                        conflict_result=conflict_result,
+                        actor_agent=critic_agent,
+                    )
+
                 return GovernedMemoryLifecycleResult(
                     success=True,
                     candidate_memory_id=candidate_memory.memory_id,
@@ -151,7 +182,9 @@ class GovernedMemoryLifecycle:
                     promotion_request_id=None,
                     promotion_status="blocked_duplicate",
                     shared_memory_id=None,
-                    operation_log_count=self._count_operation_logs(),
+                    operation_log_count=self._count_new_operation_logs(
+                        log_count_before
+                    ),
                     message=(
                         "Duplicate candidate was detected. "
                         "The memory was not written or promoted."
@@ -165,6 +198,7 @@ class GovernedMemoryLifecycle:
                     candidate_memory=candidate_memory,
                     conflict_result=conflict_result,
                     write_result=write_result,
+                    log_count_before=log_count_before,
                     message=(
                         "Private memory write reported success, but no "
                         "stored_memory_id was returned."
@@ -182,6 +216,22 @@ class GovernedMemoryLifecycle:
                     else "blocked"
                 )
 
+                if (
+                        conflict_result.conflict_type
+                        == LifecycleConflictType.CONFLICTING_ANSWER
+                ):
+                    persisted_private_memory = (
+                        self.memory_service.memory_store.get_by_id(
+                            private_memory_id
+                        )
+                    )
+
+                    self._record_detected_conflicts(
+                        subject_memory=persisted_private_memory,
+                        conflict_result=conflict_result,
+                        actor_agent=critic_agent,
+                    )
+
                 return GovernedMemoryLifecycleResult(
                     success=True,
                     candidate_memory_id=candidate_memory.memory_id,
@@ -191,7 +241,9 @@ class GovernedMemoryLifecycle:
                     promotion_request_id=None,
                     promotion_status=promotion_status,
                     shared_memory_id=None,
-                    operation_log_count=self._count_operation_logs(),
+                    operation_log_count=self._count_new_operation_logs(
+                        log_count_before
+                    ),
                     message=write_result.message,
                 )
 
@@ -209,7 +261,9 @@ class GovernedMemoryLifecycle:
                     promotion_request_id=None,
                     promotion_status="eligible_not_submitted",
                     shared_memory_id=None,
-                    operation_log_count=self._count_operation_logs(),
+                    operation_log_count=self._count_new_operation_logs(
+                        log_count_before
+                    ),
                     message=(
                         "Private memory was written successfully and is "
                         "eligible for promotion, but auto_promote is disabled."
@@ -230,7 +284,9 @@ class GovernedMemoryLifecycle:
                     promotion_request_id=None,
                     promotion_status="promotion_service_not_configured",
                     shared_memory_id=None,
-                    operation_log_count=self._count_operation_logs(),
+                    operation_log_count=self._count_new_operation_logs(
+                        log_count_before
+                    ),
                     message=(
                         "Private memory was written and passed conflict "
                         "checking, but PromotionService is not configured."
@@ -261,7 +317,9 @@ class GovernedMemoryLifecycle:
                 promotion_request_id=promotion_request_id,
                 promotion_status=promotion_status,
                 shared_memory_id=shared_memory_id,
-                operation_log_count=self._count_operation_logs(),
+                operation_log_count=self._count_new_operation_logs(
+                    log_count_before
+                ),
                 message=(
                     "Candidate memory completed the governed lifecycle: "
                     "private write, promotion review, and Coordinator approval."
@@ -290,103 +348,15 @@ class GovernedMemoryLifecycle:
                 promotion_request_id=None,
                 promotion_status="failed",
                 shared_memory_id=None,
-                operation_log_count=self._count_operation_logs(),
+                operation_log_count=self._count_new_operation_logs(
+                    log_count_before
+                ),
                 message=f"Governed memory lifecycle failed: {error}",
             )
 
     # ------------------------------------------------------------------
     # Promotion orchestration
     # ------------------------------------------------------------------
-
-    # def _run_promotion_process(
-    #     self,
-    #     *,
-    #     private_memory_id: str,
-    #     worker_agent: Agent,
-    #     critic_agent: Agent,
-    #     coordinator_agent: Agent,
-    # ) -> tuple[str, str, Optional[str]]:
-    #     """
-    #     Execute private-to-shared promotion.
-    #
-    #     The invocation helper checks the actual method signature and supplies
-    #     only parameters declared by the current PromotionService.
-    #     """
-    #
-    #     promotion_request = self._invoke_promotion_method(
-    #         method_name="submit_promotion_request",
-    #         values={
-    #             "agent": worker_agent,
-    #             "requesting_agent": worker_agent,
-    #             "proposer_agent": worker_agent,
-    #             "worker_agent": worker_agent,
-    #             "memory_id": private_memory_id,
-    #             "target_memory_id": private_memory_id,
-    #             "reason": (
-    #                 "Evidence-grounded QA memory passed conflict checking "
-    #                 "and was proposed for shared memory."
-    #             ),
-    #         },
-    #     )
-    #
-    #     promotion_request_id = self._extract_request_id(
-    #         promotion_request
-    #     )
-    #
-    #     self._invoke_promotion_method(
-    #         method_name="review_promotion_request",
-    #         values={
-    #             "agent": critic_agent,
-    #             "reviewer_agent": critic_agent,
-    #             "critic_agent": critic_agent,
-    #             "request_id": promotion_request_id,
-    #             "promotion_request_id": promotion_request_id,
-    #             "recommendation": "approve",
-    #             "approved": True,
-    #             "review_comment": (
-    #                 "The candidate passed deterministic conflict checking "
-    #                 "and is recommended for promotion."
-    #             ),
-    #             "comment": (
-    #                 "The candidate passed deterministic conflict checking "
-    #                 "and is recommended for promotion."
-    #             ),
-    #             "reason": (
-    #                 "Critic recommends promoting the verified QA memory."
-    #             ),
-    #         },
-    #     )
-    #
-    #     approval_result = self._invoke_promotion_method(
-    #         method_name="approve_promotion_request",
-    #         values={
-    #             "agent": coordinator_agent,
-    #             "approving_agent": coordinator_agent,
-    #             "coordinator_agent": coordinator_agent,
-    #             "request_id": promotion_request_id,
-    #             "promotion_request_id": promotion_request_id,
-    #             "reason": (
-    #                 "Coordinator approved the reviewed memory for "
-    #                 "shared access."
-    #             ),
-    #         },
-    #     )
-    #
-    #     shared_memory_id = self._resolve_shared_memory_id(
-    #         private_memory_id=private_memory_id,
-    #         approval_result=approval_result,
-    #     )
-    #
-    #     promotion_status = (
-    #         self._extract_status(approval_result)
-    #         or "approved"
-    #     )
-    #
-    #     return (
-    #         promotion_request_id,
-    #         promotion_status,
-    #         shared_memory_id,
-    #     )
 
     def _run_promotion_process(
             self,
@@ -468,76 +438,6 @@ class GovernedMemoryLifecycle:
             promoted_memory.memory_id,
         )
 
-    # def _invoke_promotion_method(
-    #     self,
-    #     *,
-    #     method_name: str,
-    #     values: dict[str, Any],
-    # ) -> Any:
-    #     """
-    #     Invoke one PromotionService method using its declared signature.
-    #
-    #     Unlike repeated try/except TypeError approaches, this method:
-    #     - inspects the service method once
-    #     - passes only supported argument names
-    #     - reports missing required parameters before invocation
-    #     - does not hide TypeError raised inside the service implementation
-    #     """
-    #
-    #     method = getattr(
-    #         self.promotion_service,
-    #         method_name,
-    #         None,
-    #     )
-    #
-    #     if not callable(method):
-    #         raise AttributeError(
-    #             f"PromotionService does not provide {method_name}()."
-    #         )
-    #
-    #     signature = inspect.signature(method)
-    #
-    #     positional_args: list[Any] = []
-    #     keyword_args: dict[str, Any] = {}
-    #     missing_required: list[str] = []
-    #
-    #     for parameter_name, parameter in signature.parameters.items():
-    #         if parameter_name == "self":
-    #             continue
-    #
-    #         if parameter.kind in {
-    #             inspect.Parameter.VAR_POSITIONAL,
-    #             inspect.Parameter.VAR_KEYWORD,
-    #         }:
-    #             continue
-    #
-    #         if parameter_name in values:
-    #             value = values[parameter_name]
-    #
-    #             if parameter.kind == inspect.Parameter.POSITIONAL_ONLY:
-    #                 positional_args.append(value)
-    #             else:
-    #                 keyword_args[parameter_name] = value
-    #
-    #             continue
-    #
-    #         if parameter.default is inspect.Parameter.empty:
-    #             missing_required.append(parameter_name)
-    #
-    #     if missing_required:
-    #         raise TypeError(
-    #             f"Cannot call PromotionService.{method_name}(). "
-    #             f"Missing required parameters: {missing_required}. "
-    #             "Update the lifecycle alias mapping to match the actual "
-    #             "PromotionService interface."
-    #         )
-    #
-    #     return method(
-    #         *positional_args,
-    #         **keyword_args,
-    #     )
-
-
     # ------------------------------------------------------------------
     # Memory helpers
     # ------------------------------------------------------------------
@@ -563,113 +463,120 @@ class GovernedMemoryLifecycle:
 
         return memory_store.list_active()
 
-    # def _resolve_shared_memory_id(
-    #     self,
-    #     *,
-    #     private_memory_id: str,
-    #     approval_result: Any,
-    # ) -> Optional[str]:
-    #     """
-    #     Resolve the shared memory after Coordinator approval.
-    #
-    #     Normal promotion updates the existing private memory's scope, so its
-    #     memory ID usually remains unchanged.
-    #     """
-    #
-    #     if isinstance(approval_result, MemoryItem):
-    #         return approval_result.memory_id
-    #
-    #     for field_name in [
-    #         "shared_memory_id",
-    #         "promoted_memory_id",
-    #         "memory_id",
-    #         "target_memory_id",
-    #     ]:
-    #         value = self._read_field(
-    #             approval_result,
-    #             field_name,
-    #         )
-    #
-    #         if value:
-    #             return str(value)
-    #
-    #     memory_store = self.memory_service.memory_store
-    #
-    #     try:
-    #         memory = memory_store.get_by_id(
-    #             private_memory_id
-    #         )
-    #     except Exception:
-    #         return None
-    #
-    #     scope = memory.metadata.scope
-    #
-    #     if hasattr(scope, "value"):
-    #         scope = scope.value
-    #
-    #     if str(scope).strip().lower() == "shared":
-    #         return memory.memory_id
-    #
-    #     return None
-
-    # ------------------------------------------------------------------
-    # Result extraction helpers
-    # ------------------------------------------------------------------
-
-    # @classmethod
-    # def _extract_request_id(
-    #     cls,
-    #     promotion_request: Any,
-    # ) -> str:
-    #     for field_name in [
-    #         "request_id",
-    #         "promotion_request_id",
-    #         "id",
-    #     ]:
-    #         value = cls._read_field(
-    #             promotion_request,
-    #             field_name,
-    #         )
-    #
-    #         if value:
-    #             return str(value)
-    #
-    #     raise ValueError(
-    #         "PromotionService.submit_promotion_request() did not return "
-    #         "an object containing request_id, promotion_request_id, or id."
-    #     )
-    #
-    # @classmethod
-    # def _extract_status(
-    #     cls,
-    #     value: Any,
-    # ) -> Optional[str]:
-    #     status = cls._read_field(value, "status")
-    #
-    #     if status is None:
-    #         return None
-    #
-    #     if hasattr(status, "value"):
-    #         status = status.value
-    #
-    #     return str(status)
-    #
-    # @staticmethod
-    # def _read_field(
-    #     value: Any,
-    #     field_name: str,
-    # ) -> Any:
-    #     if value is None:
-    #         return None
-    #
-    #     if isinstance(value, dict):
-    #         return value.get(field_name)
-    #
-    #     return getattr(value, field_name, None)
-
     # ------------------------------------------------------------------
     # Logging helpers
     # ------------------------------------------------------------------
+
+    @classmethod
+    def _map_conflict_type(
+        cls,
+        conflict_type: LifecycleConflictType,
+    ) -> OperationConflictType | None:
+        """
+        Convert lifecycle conflict type into operation-log conflict type.
+
+        NONE returns None because no conflict log should be created.
+        """
+
+        if conflict_type == LifecycleConflictType.NONE:
+            return None
+
+        mapped_type = cls.CONFLICT_TYPE_MAP.get(
+            conflict_type
+        )
+
+        if mapped_type is None:
+            raise ValueError(
+                "Unsupported lifecycle conflict type for operation logging: "
+                f"{conflict_type!r}."
+            )
+
+        return mapped_type
+
+    def _record_detected_conflicts(
+            self,
+            *,
+            subject_memory: MemoryItem,
+            conflict_result: ConflictCheckResult,
+            actor_agent: Agent,
+    ) -> int:
+        """
+        Record pairwise conflict logs between the candidate/new memory and
+        every matched existing memory.
+
+        Args:
+            subject_memory:
+                For duplicate, this is the temporary candidate memory.
+                For conflicting answer, this is the persisted private memory.
+            conflict_result:
+                Conflict detection result containing matched memory records.
+            actor_agent:
+                Agent responsible for the conflict assessment, normally Critic.
+
+        Returns:
+            Number of conflict log records created.
+        """
+
+        if conflict_result.conflict_type not in {
+            LifecycleConflictType.DUPLICATE,
+            LifecycleConflictType.CONFLICTING_ANSWER,
+        }:
+            return 0
+
+        operation_conflict_type = self._map_conflict_type(
+            conflict_result.conflict_type
+        )
+
+        if operation_conflict_type is None:
+            return 0
+
+        if not conflict_result.matched_records:
+            raise ValueError(
+                "Conflict result contains no matched memory records."
+            )
+
+        created_log_count = 0
+
+        for matched_record in conflict_result.matched_records:
+            existing_memory = (
+                self.memory_service.memory_store.get_by_id(
+                    matched_record.matched_memory_id
+                )
+            )
+
+            if (
+                    conflict_result.conflict_type
+                    == LifecycleConflictType.DUPLICATE
+            ):
+                description = (
+                    "Duplicate memory detected. "
+                    f"Candidate memory {subject_memory.memory_id!r} "
+                    f"duplicates existing memory "
+                    f"{existing_memory.memory_id!r}. "
+                    "The candidate write and promotion were blocked."
+                )
+
+            else:
+                description = (
+                    "Conflicting answer detected. "
+                    f"Private memory {subject_memory.memory_id!r} "
+                    f"conflicts with existing memory "
+                    f"{existing_memory.memory_id!r}. "
+                    "The new memory remains private and automatic "
+                    "promotion was blocked."
+                )
+
+            self.operation_log_service.record_conflict_detected(
+                memory_a=subject_memory,
+                memory_b=existing_memory,
+                actor_agent=actor_agent,
+                conflict_type=operation_conflict_type,
+                description=description,
+            )
+
+            created_log_count += 1
+
+        return created_log_count
 
     def _count_operation_logs(self) -> Optional[int]:
         """
@@ -678,48 +585,40 @@ class GovernedMemoryLifecycle:
         MemoryService already records private memory creation when an
         OperationLogStore is provided.
         """
-
-        # operation_log_store = getattr(
-        #     self.memory_service,
-        #     "operation_log_store",
-        #     None,
-        # )
-        #
-        # if operation_log_store is None:
-        #     return None
-        #
-        # count_method = getattr(
-        #     operation_log_store,
-        #     "count",
-        #     None,
-        # )
-        #
-        # if callable(count_method):
-        #     return int(count_method())
-        #
-        # list_method = getattr(
-        #     operation_log_store,
-        #     "list_all",
-        #     None,
-        # )
-        #
-        # if callable(list_method):
-        #     return len(list_method())
-        #
-        # return None
         return self.operation_log_service.operation_log_store.count()
+
+    def _count_new_operation_logs(
+            self,
+            log_count_before: int,
+    ) -> int:
+        """
+        Return the number of operation logs created during the current
+        lifecycle execution.
+        """
+
+        log_count_after = self._count_operation_logs()
+        new_log_count = log_count_after - log_count_before
+
+        if new_log_count < 0:
+            raise RuntimeError(
+                "Operation log count decreased during lifecycle execution. "
+                f"before={log_count_before}, after={log_count_after}."
+            )
+
+        return new_log_count
 
     # ------------------------------------------------------------------
     # Failure helper
     # ------------------------------------------------------------------
 
     def _build_failure_result(
-        self,
-        *,
-        candidate_memory: MemoryItem,
-        conflict_result: ConflictCheckResult,
-        write_result: MemoryWriteResult,
-        message: str,
+            self,
+            *,
+            candidate_memory: MemoryItem,
+            conflict_result: ConflictCheckResult,
+            write_result: MemoryWriteResult,
+            log_count_before: int,
+            message: str,
     ) -> GovernedMemoryLifecycleResult:
         return GovernedMemoryLifecycleResult(
             success=False,
@@ -730,6 +629,9 @@ class GovernedMemoryLifecycle:
             promotion_request_id=None,
             promotion_status="failed",
             shared_memory_id=None,
-            operation_log_count=self._count_operation_logs(),
+            # operation_log_count=self._count_operation_logs(),
+            operation_log_count=self._count_new_operation_logs(
+                log_count_before
+            ),
             message=message,
         )

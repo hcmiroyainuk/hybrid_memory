@@ -33,10 +33,9 @@ from src.memory.manager.memory_store import MemoryStore
 from src.memory.manager.operation_log_store import (
     OperationLogStore,
 )
+from src.memory.services import OperationLogService
 from src.memory.services.memory_service import MemoryService
-from src.memory.services.operation_log_service import (
-    OperationLogService,
-)
+
 from src.memory.services.permission_service import (
     PermissionService,
 )
@@ -210,18 +209,8 @@ def candidate_memory() -> MemoryItem:
 
 
 @pytest.fixture
-def lifecycle_environment(
-    tmp_path,
-) -> dict[str, Any]:
-    """
-    Build the real service graph with isolated temporary JSON files.
-
-    All services share:
-    - the same MemoryStore
-    - the same OperationLogStore
-    - the same PermissionService
-    """
-
+def lifecycle_environment(tmp_path):
+    # 1. 创建底层 Store
     memory_store = MemoryStore(
         tmp_path / "memories.json"
     )
@@ -230,12 +219,17 @@ def lifecycle_environment(
         tmp_path / "operation_logs.json"
     )
 
+    request_store = InMemoryPromotionRequestStore()
+
+    # 2. 创建共享的权限服务
     permission_service = PermissionService()
 
+    # 3. 创建日志业务服务
     operation_log_service = OperationLogService(
         operation_log_store=operation_log_store,
     )
 
+    # 4. 创建 MemoryService
     memory_service = MemoryService(
         memory_store=memory_store,
         operation_log_store=operation_log_store,
@@ -243,8 +237,7 @@ def lifecycle_environment(
         permission_service=permission_service,
     )
 
-    request_store = InMemoryPromotionRequestStore()
-
+    # 5. 创建 PromotionService
     promotion_service = PromotionService(
         memory_store=memory_store,
         request_store=request_store,
@@ -252,10 +245,12 @@ def lifecycle_environment(
         permission_service=permission_service,
     )
 
+    # 6. 创建写入控制器
     write_controller = MemoryWriteController(
         memory_service=memory_service,
     )
 
+    # 7. 创建最终 Lifecycle
     lifecycle = GovernedMemoryLifecycle(
         memory_service=memory_service,
         conflict_detector=NoConflictDetector(),
@@ -264,6 +259,7 @@ def lifecycle_environment(
         promotion_service=promotion_service,
     )
 
+    # 8. 把测试需要的对象返回
     return {
         "memory_store": memory_store,
         "operation_log_store": operation_log_store,
@@ -275,7 +271,6 @@ def lifecycle_environment(
         "write_controller": write_controller,
         "lifecycle": lifecycle,
     }
-
 
 # ----------------------------------------------------------------------
 # Helper functions
@@ -611,11 +606,13 @@ def test_governed_lifecycle_handles_missing_promotion_service(
     operation_log_store = lifecycle_environment[
         "operation_log_store"
     ]
+    operation_log_service = lifecycle_environment["operation_log_service"]
 
     lifecycle_without_promotion = GovernedMemoryLifecycle(
         memory_service=memory_service,
         conflict_detector=NoConflictDetector(),
         memory_write_controller=write_controller,
+        operation_log_service=operation_log_service,
         promotion_service=None,
     )
 
