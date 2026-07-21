@@ -1,44 +1,61 @@
-from .output_schemas import (
-    AgentAnswer,
-    WorkerAOutput,
-    WorkerBOutput,
-    CriticOutput,
-    CoordinatorOutput,
-    LLMCallMetadata,
-)
+"""
+Public interface for the generic LLM layer.
 
-from .output_parser import (
-    LLMOutputParser,
-    LLMOutputParseError,
-)
-
-from .prompt_templates import (
-    PromptTemplates,
-    build_worker_a_prompt,
-    build_worker_b_prompt,
-    build_critic_prompt,
-    build_coordinator_prompt,
-)
+This package exposes:
+- workflow-independent LLM clients;
+- reusable prompt-template builders;
+- generic structured-output parsing;
+- shared Pydantic output schemas.
+"""
 
 from .llm_client import (
     LLMClient,
     LLMClientConfigurationError,
+    LLMClientInvocationError,
+)
+from .output_parser import (
+    LLMOutputParseError,
+    LLMOutputParser,
+)
+from .output_schemas import (
+    AgentAnswer,
+    ExtractedMemory,
+    LLMCallMetadata,
+    MemoryExtractionOutput,
+    MemoryReviewOutput,
+    PromotionDecisionOutput,
+    TaskRoutingOutput,
+)
+from .prompt_templates import (
+    CoordinatorPromptTemplate,
+    CriticPromptTemplate,
+    PromptTemplates,
+    WorkerPromptTemplate,
 )
 
+
 __all__ = [
-    "AgentAnswer",
-    "WorkerAOutput",
-    "WorkerBOutput",
-    "CriticOutput",
-    "CoordinatorOutput",
-    "LLMCallMetadata",
-    "LLMOutputParser",
-    "LLMOutputParseError",
-    "PromptTemplates",
-    "build_worker_a_prompt",
-    "build_worker_b_prompt",
-    "build_critic_prompt",
-    "build_coordinator_prompt",
+    # Client
     "LLMClient",
     "LLMClientConfigurationError",
+    "LLMClientInvocationError",
+
+    # Parser
+    "LLMOutputParser",
+    "LLMOutputParseError",
+
+    # Schemas
+    "AgentAnswer",
+    "ExtractedMemory",
+    "MemoryExtractionOutput",
+    "MemoryReviewOutput",
+    "TaskRoutingOutput",
+    "PromotionDecisionOutput",
+    "LLMCallMetadata",
+
+    # Prompt templates
+    "PromptTemplates",
+    "WorkerPromptTemplate",
+    "CriticPromptTemplate",
+    "CoordinatorPromptTemplate",
 ]

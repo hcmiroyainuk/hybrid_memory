@@ -1,516 +1,598 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
+from typing import Any, TypeVar
 
-from src.memory.external_knowledge import RetrievedKnowledge
-from .output_schemas import AgentAnswer, CriticOutput
+from pydantic import BaseModel
+
+from .output_schemas import (
+    AgentAnswer,
+    ExtractedMemory,
+    MemoryExtractionOutput,
+    MemoryReviewOutput,
+    PromotionDecisionOutput,
+    TaskRoutingOutput,
+)
+
+
+SchemaT = TypeVar("SchemaT", bound=BaseModel)
+
+
+def _clean_lines(values: Sequence[str] | None) -> list[str]:
+    """
+    Normalize a sequence of prompt instructions while preserving order.
+    """
+    cleaned: list[str] = []
+
+    for value in values or []:
+        item = str(value).strip()
+        if item and item not in cleaned:
+            cleaned.append(item)
+
+    return cleaned
+
+
+def _format_bullets(values: Sequence[str]) -> str:
+    """
+    Render prompt instructions as Markdown bullets.
+    """
+    return "\n".join(f"- {value}" for value in values)
+
+
+def _format_value(value: Any) -> str:
+    """
+    Convert common Python and Pydantic values into readable prompt text.
+    """
+    if value is None:
+        return "Not provided."
+
+    if isinstance(value, BaseModel):
+        return value.model_dump_json(indent=2)
+
+    if isinstance(value, str):
+        text = value.strip()
+        return text or "Not provided."
+
+    if isinstance(value, Mapping):
+        return json.dumps(value, indent=2, ensure_ascii=False, default=str)
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return json.dumps(list(value), indent=2, ensure_ascii=False, default=str)
+
+    return str(value)
+
+
+def _format_context_sections(
+    sections: Mapping[str, Any] | None,
+) -> str:
+    """
+    Render arbitrary named context sections.
+
+    This keeps prompt templates independent of a specific dataset, retriever,
+    workflow state, or external-knowledge schema.
+    """
+    if not sections:
+        return "No additional context."
+
+    rendered: list[str] = []
+
+    for heading, value in sections.items():
+        title = str(heading).strip()
+        if not title:
+            continue
+
+        rendered.append(f"{title}:\n{_format_value(value)}")
+
+    return "\n\n".join(rendered) if rendered else "No additional context."
+
+
+def _schema_hint(schema_model: type[SchemaT]) -> str:
+    """
+    Return the Pydantic JSON schema used by structured-output calls.
+    """
+    return json.dumps(
+        schema_model.model_json_schema(),
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+class _BasePromptTemplate:
+    """
+    Shared constructor logic for role-specific prompt templates.
+
+    additional_tasks and additional_rules are attached when the template
+    instance is created. This allows each agent instance to add role-specific
+    behaviour without duplicating the core prompt.
+    """
+
+    def __init__(
+        self,
+        *,
+        additional_tasks: Sequence[str] | None = None,
+        additional_rules: Sequence[str] | None = None,
+    ) -> None:
+        self.additional_tasks = _clean_lines(additional_tasks)
+        self.additional_rules = _clean_lines(additional_rules)
+
+    def _compose_tasks(
+        self,
+        required_tasks: Sequence[str],
+    ) -> list[str]:
+        return _clean_lines([*required_tasks, *self.additional_tasks])
+
+    def _compose_rules(
+        self,
+        required_rules: Sequence[str],
+    ) -> list[str]:
+        return _clean_lines([*required_rules, *self.additional_rules])
+
+
+class WorkerPromptTemplate(_BasePromptTemplate):
+    """
+    Generic prompt template shared by all task agents.
+
+    Alice, Bob, Charlie, Dave, or any future worker can use the same template.
+    Agent-specific behaviour is supplied through role_description,
+    additional_tasks, and additional_rules at construction time.
+    """
+
+    _CORE_RULES = (
+        "Use only the assigned input, the permission-filtered accessible memory, and the explicitly provided context.",
+        "Do not claim access to hidden, private, or unavailable information.",
+        "Do not request or invent memory content that is not shown.",
+        "Keep the answer direct and keep the reasoning brief.",
+        "Record only memory IDs and source IDs that were actually used.",
+        "Follow the required structured-output schema exactly.",
+    )
+
+    def __init__(
+        self,
+        *,
+        agent_id: str,
+        role_description: str | None = None,
+        additional_tasks: Sequence[str] | None = None,
+        additional_rules: Sequence[str] | None = None,
+    ) -> None:
+        super().__init__(
+            additional_tasks=additional_tasks,
+            additional_rules=additional_rules,
+        )
+
+        agent_id = agent_id.strip()
+        if not agent_id:
+            raise ValueError("agent_id cannot be empty.")
+
+        self.agent_id = agent_id
+        self.role_description = (
+            role_description.strip()
+            if role_description and role_description.strip()
+            else "Complete assigned tasks as a task-oriented agent."
+        )
+
+    def build_answer_prompt(
+        self,
+        *,
+        task: str,
+        task_input: str | None = None,
+        accessible_memory_context: str | None = None,
+        context_sections: Mapping[str, Any] | None = None,
+    ) -> str:
+        """
+        Build a general task-answering prompt returning AgentAnswer.
+        """
+        required_tasks = (
+            "Complete the assigned task using the available evidence.",
+            "Produce one final answer and identify the memories, sources, and agents that materially contributed to it.",
+        )
+
+        answer_rules = (
+            *self._CORE_RULES,
+
+            "The answer field must contain only the final answer items required "
+            "by the task.",
+
+            "When the question requires multiple answer items, separate them "
+            "using a comma followed by one space.",
+
+            "Return answer items in the same order as the corresponding people "
+            "or subjects appear in the question.",
+
+            "Do not use sentences, labels, bullet points, explanations, quotation "
+            "marks, brackets, or answer prefixes in the answer field.",
+
+            "Use commas, not 'and', '&', semicolons, or line breaks, to separate "
+            "different answer items. Do not remove 'and' or '&' when it is part "
+            "of an answer item's proper name.",
+
+            "Do not repeat the same answer item.",
+
+            "Put all explanation and justification in the reasoning field, "
+            "never in the answer field.",
+
+            "Use only answer items supported by the accessible memory or other "
+            "explicitly supplied context.",
+
+            "For every accessible memory that materially supports the answer, "
+            "copy its exact memory_id into used_memory_ids.",
+
+            "For every used memory, copy its displayed source_ids into "
+            "supporting_source_ids. Do not invent or modify source IDs.",
+
+            "For every used memory, copy its displayed owner_agent_id into "
+            "contributing_agent_ids. Do not include agents whose memories were "
+            "not materially used.",
+
+            "Use the exact identifiers shown in the accessible memory context. "
+            "Do not use memory numbering such as 'Memory 1' unless that is the "
+            "actual displayed memory_id.",
+        )
+
+        tasks = self._compose_tasks(required_tasks)
+        rules = self._compose_rules(answer_rules)
+
+        return f"""
+You are {self.agent_id}, a task agent in a multi-agent system.
+
+Role:
+{self.role_description}
+
+Tasks:
+{_format_bullets(tasks)}
+
+Important rules:
+{_format_bullets(rules)}
+
+Assigned task:
+{_format_value(task)}
+
+Task input:
+{_format_value(task_input)}
+
+Accessible memory:
+{_format_value(accessible_memory_context)}
+
+Additional context:
+{_format_context_sections(context_sections)}
+
+Required output schema:
+{_schema_hint(AgentAnswer)}
+""".strip()
+
+    def build_memory_extraction_prompt(
+        self,
+        *,
+        source_content: str,
+        source_ids: Sequence[str] | None = None,
+        task_context: str | None = None,
+        context_sections: Mapping[str, Any] | None = None,
+    ) -> str:
+        """
+        Build a prompt that converts local information into memory candidates.
+        """
+        required_tasks = (
+            "Extract reusable memories from the supplied local information.",
+            "Represent each memory as an atomic, self-contained statement.",
+        )
+
+        extraction_rules = (
+            *self._CORE_RULES,
+            "Extract only information directly supported by the supplied source.",
+            "Do not combine unrelated facts into one memory.",
+            "Preserve the original meaning and avoid adding unsupported detail.",
+            "Use source_ids only from the source identifiers provided below.",
+            "Mark a memory as shareable only when its content is suitable for later controlled sharing.",
+        )
+
+        tasks = self._compose_tasks(required_tasks)
+        rules = self._compose_rules(extraction_rules)
+
+        extraction_context = {
+            "Source IDs": list(source_ids or []),
+            "Task context": task_context,
+            **dict(context_sections or {}),
+        }
+
+        return f"""
+You are {self.agent_id}, a task agent preparing local information for memory storage.
+
+Role:
+{self.role_description}
+
+Tasks:
+{_format_bullets(tasks)}
+
+Important rules:
+{_format_bullets(rules)}
+
+Local source content:
+{_format_value(source_content)}
+
+Extraction context:
+{_format_context_sections(extraction_context)}
+
+Required output schema:
+{_schema_hint(MemoryExtractionOutput)}
+""".strip()
+
+
+class CriticPromptTemplate(_BasePromptTemplate):
+    """
+    Prompt template for memory-governance review.
+
+    The critic's essential review duties and safety rules are fixed. Extra
+    tasks and rules may be added when creating a critic instance.
+    """
+
+    _CORE_TASKS = (
+        "Review one candidate memory for the requested governance action.",
+        "Classify the candidate and recommend an appropriate action.",
+    )
+
+    _CORE_RULES = (
+        "Base the review only on the candidate memory, supplied policy, task context, and existing-memory context.",
+        "Check relevance, policy compliance, duplication, conflict, and temporal validity.",
+        "Do not invent facts, policies, timestamps, or related memory IDs.",
+        "Do not rewrite, persist, promote, delete, merge, or supersede any memory.",
+        "The critic provides a recommendation only; the coordinator retains final authority.",
+        "Use related_memory_ids only for memories explicitly present in the supplied context.",
+        "Explain the recommendation briefly and follow the required structured-output schema exactly.",
+    )
+
+    def __init__(
+        self,
+        *,
+        critic_id: str = "critic",
+        additional_tasks: Sequence[str] | None = None,
+        additional_rules: Sequence[str] | None = None,
+    ) -> None:
+        super().__init__(
+            additional_tasks=additional_tasks,
+            additional_rules=additional_rules,
+        )
+
+        critic_id = critic_id.strip()
+        if not critic_id:
+            raise ValueError("critic_id cannot be empty.")
+
+        self.critic_id = critic_id
+
+    def build_memory_review_prompt(
+        self,
+        *,
+        candidate_memory_id: str,
+        candidate_memory: ExtractedMemory | BaseModel | Mapping[str, Any] | str,
+        requested_action: str,
+        requester_agent_id: str,
+        target_agent_ids: Sequence[str] | None = None,
+        task_context: str | None = None,
+        policy_context: Any = None,
+        existing_memory_context: Any = None,
+        context_sections: Mapping[str, Any] | None = None,
+    ) -> str:
+        tasks = self._compose_tasks(self._CORE_TASKS)
+        rules = self._compose_rules(self._CORE_RULES)
+
+        review_context = {
+            "Candidate memory ID": candidate_memory_id,
+            "Candidate memory": candidate_memory,
+            "Requested action": requested_action,
+            "Requester agent ID": requester_agent_id,
+            "Target agent IDs": list(target_agent_ids or []),
+            "Task context": task_context,
+            "Policy context": policy_context,
+            "Existing memory context": existing_memory_context,
+            **dict(context_sections or {}),
+        }
+
+        return f"""
+You are {self.critic_id}, the memory-governance critic in a multi-agent system.
+
+Tasks:
+{_format_bullets(tasks)}
+
+Important rules:
+{_format_bullets(rules)}
+
+Review context:
+{_format_context_sections(review_context)}
+
+Required output schema:
+{_schema_hint(MemoryReviewOutput)}
+""".strip()
+
+
+class CoordinatorPromptTemplate(_BasePromptTemplate):
+    """
+    Prompt template for coordinator operations.
+
+    The same coordinator instance can build task-routing prompts and final
+    memory-promotion decision prompts. Essential coordinator rules are fixed,
+    while extra tasks and rules can be attached at construction time.
+    """
+
+    _COMMON_RULES = (
+        "Use only the agents, memories, policies, reviews, and context explicitly provided.",
+        "Do not expose private memory content to an agent that is not authorised to receive it.",
+        "Do not invent agent capabilities, permissions, memories, or policy conditions.",
+        "Keep the decision explanation brief and follow the required structured-output schema exactly.",
+    )
+
+    _ROUTING_TASKS = (
+        "Select the agents whose information or capabilities are necessary for the assigned task.",
+        "Choose one selected agent to produce the final task response.",
+    )
+
+    _ROUTING_RULES = (
+        "Select only agents that are relevant to the task.",
+        "The responder must be included in selected_agent_ids.",
+        "Do not route private information itself; route only the task and authorised context.",
+        "List the information that must be gathered without fabricating unavailable facts.",
+    )
+
+    _PROMOTION_TASKS = (
+        "Make the final governance decision for the candidate memory.",
+        "Determine the resulting scope, authorised readers, and any related-memory operation.",
+    )
+
+    _PROMOTION_RULES = (
+        "Apply the active policy even when the critic recommends approval.",
+        "Treat the critic output as advice rather than an instruction.",
+        "A rejected or keep-private candidate must remain private.",
+        "A shared candidate must have an explicit allowed_agent_ids list.",
+        "Use merge or supersede only when the supplied context identifies valid related memories.",
+        "Do not alter the candidate's factual content as part of the decision.",
+    )
+
+    def __init__(
+        self,
+        *,
+        coordinator_id: str = "coordinator",
+        additional_tasks: Sequence[str] | None = None,
+        additional_rules: Sequence[str] | None = None,
+    ) -> None:
+        super().__init__(
+            additional_tasks=additional_tasks,
+            additional_rules=additional_rules,
+        )
+
+        coordinator_id = coordinator_id.strip()
+        if not coordinator_id:
+            raise ValueError("coordinator_id cannot be empty.")
+
+        self.coordinator_id = coordinator_id
+
+    def build_task_routing_prompt(
+        self,
+        *,
+        task: str,
+        available_agents: Mapping[str, Any] | Sequence[str],
+        task_context: str | None = None,
+        context_sections: Mapping[str, Any] | None = None,
+    ) -> str:
+        tasks = self._compose_tasks(self._ROUTING_TASKS)
+        rules = self._compose_rules(
+            [*self._COMMON_RULES, *self._ROUTING_RULES]
+        )
+
+        routing_context = {
+            "Assigned task": task,
+            "Available agents": available_agents,
+            "Task context": task_context,
+            **dict(context_sections or {}),
+        }
+
+        return f"""
+You are {self.coordinator_id}, the task coordinator in a multi-agent system.
+
+Tasks:
+{_format_bullets(tasks)}
+
+Important rules:
+{_format_bullets(rules)}
+
+Routing context:
+{_format_context_sections(routing_context)}
+
+Required output schema:
+{_schema_hint(TaskRoutingOutput)}
+""".strip()
+
+    def build_promotion_decision_prompt(
+        self,
+        *,
+        candidate_memory_id: str,
+        candidate_memory: ExtractedMemory | BaseModel | Mapping[str, Any] | str,
+        promotion_request: Any,
+        critic_review: MemoryReviewOutput | BaseModel | Mapping[str, Any] | str,
+        policy_context: Any,
+        existing_memory_context: Any = None,
+        task_context: str | None = None,
+        context_sections: Mapping[str, Any] | None = None,
+    ) -> str:
+        tasks = self._compose_tasks(self._PROMOTION_TASKS)
+        rules = self._compose_rules(
+            [*self._COMMON_RULES, *self._PROMOTION_RULES]
+        )
+
+        decision_context = {
+            "Candidate memory ID": candidate_memory_id,
+            "Candidate memory": candidate_memory,
+            "Promotion request": promotion_request,
+            "Critic review": critic_review,
+            "Policy context": policy_context,
+            "Existing memory context": existing_memory_context,
+            "Task context": task_context,
+            **dict(context_sections or {}),
+        }
+
+        return f"""
+You are {self.coordinator_id}, the final memory-governance authority in a multi-agent system.
+
+Tasks:
+{_format_bullets(tasks)}
+
+Important rules:
+{_format_bullets(rules)}
+
+Decision context:
+{_format_context_sections(decision_context)}
+
+Required output schema:
+{_schema_hint(PromotionDecisionOutput)}
+""".strip()
 
 
 class PromptTemplates:
     """
-    Prompt templates for the RAG-based multi-agent QA baseline.
+    Small factory facade for constructing reusable prompt-template instances.
 
-    Agents:
-    - Worker A: direct parametric QA agent
-    - Worker B: retrieval-grounded QA agent
-    - Critic: compares Worker A and Worker B
-    - Coordinator: produces final answer
-
-    This module only builds prompts.
-    It does not call LLMs or parse outputs.
-
-    accessible_memory_context is permission-filtered memory context.
-    It must be prepared before prompt construction by GovernedContextBuilder.
+    Example:
+        alice_prompts = PromptTemplates.worker(
+            agent_id="alice_agent",
+            role_description="Represents Alice and manages Alice's private memory.",
+            additional_rules=["Share only memories relevant to the active task."],
+        )
     """
 
-    # ------------------------------------------------------------------
-    # Worker A prompt
-    # ------------------------------------------------------------------
-
     @staticmethod
-    def build_worker_a_prompt(
-        question: str,
-        accessible_memory_context: str | None = None,
-    ) -> str:
-        """
-        Build prompt for Worker A.
-
-        Worker A answers using parametric model knowledge and optional
-        permission-filtered accessible memory.
-
-        Worker A does not use external retrieved evidence.
-        """
-
-        memory_text = PromptTemplates.format_accessible_memory_context(
-            accessible_memory_context
-        )
-
-        return f"""
-You are Worker A, a direct question-answering agent.
-
-Your task:
-Answer the question using your own knowledge and the accessible memory if it is relevant.
-
-Important rules:
-- You may use accessible memory only if it helps answer the question.
-- The accessible memory has already been permission-filtered by the system.
-- Do not infer or request memories that are not shown.
-- Return a short answer span.
-- Do not return a full sentence unless necessary.
-- Do not include explanation in the answer field.
-- Put explanation only in the reasoning field.
-- If uncertain, still give the best possible answer.
-- Your output must follow the required schema.
-
-Question:
-{question}
-
-Accessible memory:
-{memory_text}
-
-Required output schema:
-{PromptTemplates._schema_hint_for_agent_answer()}
-""".strip()
-
-    # ------------------------------------------------------------------
-    # Worker B prompt
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def build_worker_b_prompt(
-        question: str,
-        retrieved_knowledge: list[RetrievedKnowledge],
-        accessible_memory_context: str | None = None,
-    ) -> str:
-        """
-        Build prompt for Worker B.
-
-        Worker B answers using retrieved external evidence and optional
-        permission-filtered accessible memory.
-        """
-
-        memory_text = PromptTemplates.format_accessible_memory_context(
-            accessible_memory_context
-        )
-        evidence_text = PromptTemplates.format_retrieved_knowledge(
-            retrieved_knowledge
-        )
-
-        return f"""
-You are Worker B, a retrieval-grounded question-answering agent.
-
-Your task:
-Answer the question using the retrieved evidence and the accessible memory if relevant.
-
-Important rules:
-- Prefer answers directly supported by the retrieved evidence.
-- You may use accessible memory only if it is relevant.
-- The accessible memory has already been permission-filtered by the system.
-- Do not infer or request memories that are not shown.
-- Return a short answer span.
-- Do not return a full sentence unless necessary.
-- Do not include explanation in the answer field.
-- Put explanation only in the reasoning field.
-- Include the chunk IDs that support your answer in evidence_chunk_ids.
-- If the retrieved evidence is insufficient, give the best possible answer and use lower confidence.
-- Your output must follow the required schema.
-
-Question:
-{question}
-
-Accessible memory:
-{memory_text}
-
-Retrieved evidence:
-{evidence_text}
-
-Required output schema:
-{PromptTemplates._schema_hint_for_agent_answer()}
-""".strip()
-
-    # ------------------------------------------------------------------
-    # Critic prompt
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def build_critic_prompt(
-        question: str,
-        worker_a_output: AgentAnswer,
-        worker_b_output: AgentAnswer,
-        retrieved_knowledge: list[RetrievedKnowledge],
-        accessible_memory_context: str | None = None,
-    ) -> str:
-        """
-        Build prompt for the Critic.
-
-        The Critic compares Worker A and Worker B and recommends one answer.
-        It may also use permission-filtered accessible memory as supporting context.
-        """
-
-        memory_text = PromptTemplates.format_accessible_memory_context(
-            accessible_memory_context
-        )
-        evidence_text = PromptTemplates.format_retrieved_knowledge(
-            retrieved_knowledge
-        )
-
-        worker_a_text = PromptTemplates.format_agent_answer(
-            agent_name="Worker A",
-            answer=worker_a_output,
-        )
-
-        worker_b_text = PromptTemplates.format_agent_answer(
-            agent_name="Worker B",
-            answer=worker_b_output,
-        )
-
-        return f"""
-You are the Critic in a multi-agent question-answering system.
-
-Your task:
-Compare Worker A and Worker B, evaluate their answers, and recommend the most likely answer.
-
-Important rules:
-- Check whether Worker B's answer is supported by the retrieved evidence.
-- Use accessible memory only if it is relevant to the question or to answer validation.
-- The accessible memory has already been permission-filtered by the system.
-- Do not infer or request memories that are not shown.
-- Do not blindly prefer Worker B.
-- Prefer Worker B only if the evidence is relevant and supports the answer.
-- If the retrieved evidence is irrelevant or insufficient, prefer the more plausible answer.
-- If accessible memory conflicts with worker outputs or evidence, mention the conflict in comment.
-- If both answers are weak, still recommend the best possible short answer.
-- recommended_answer must be a short answer span.
-- Do not include explanation in recommended_answer.
-- Put explanation only in comment.
-- Your output must follow the required schema.
-
-Question:
-{question}
-
-Accessible memory:
-{memory_text}
-
-Worker outputs:
-{worker_a_text}
-
-{worker_b_text}
-
-Retrieved evidence:
-{evidence_text}
-
-Required output schema:
-{PromptTemplates._schema_hint_for_critic_output()}
-""".strip()
-
-    # ------------------------------------------------------------------
-    # Coordinator prompt
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def build_coordinator_prompt(
-        question: str,
-        worker_a_output: AgentAnswer,
-        worker_b_output: AgentAnswer,
-        critic_output: CriticOutput,
-        retrieved_knowledge: list[RetrievedKnowledge],
-        accessible_memory_context: str | None = None,
-    ) -> str:
-        """
-        Build prompt for the Coordinator.
-
-        The Coordinator produces the final answer used for evaluation.
-        It may use permission-filtered accessible memory as additional context.
-        """
-
-        memory_text = PromptTemplates.format_accessible_memory_context(
-            accessible_memory_context
-        )
-        evidence_text = PromptTemplates.format_retrieved_knowledge(
-            retrieved_knowledge
-        )
-
-        worker_a_text = PromptTemplates.format_agent_answer(
-            agent_name="Worker A",
-            answer=worker_a_output,
-        )
-
-        worker_b_text = PromptTemplates.format_agent_answer(
-            agent_name="Worker B",
-            answer=worker_b_output,
-        )
-
-        critic_text = PromptTemplates.format_critic_output(critic_output)
-
-        return f"""
-You are the Coordinator in a multi-agent question-answering system.
-
-Your task:
-Produce the final answer for evaluation.
-
-You are given:
-- The original question
-- Permission-filtered accessible memory
-- Worker A's direct answer
-- Worker B's retrieval-grounded answer
-- The retrieved evidence
-- The Critic's recommendation
-
-Important rules:
-- Use all available information.
-- Use accessible memory only if it is relevant.
-- The accessible memory has already been permission-filtered by the system.
-- Do not infer or request memories that are not shown.
-- Prefer evidence-supported answers when the retrieved evidence is relevant.
-- If accessible memory conflicts with evidence or worker outputs, reason carefully.
-- Do not blindly follow any single worker.
-- final_answer must be one short answer span.
-- Do not include explanation in final_answer.
-- Put explanation only in reasoning.
-- Your output must follow the required schema.
-
-Question:
-{question}
-
-Accessible memory:
-{memory_text}
-
-Worker outputs:
-{worker_a_text}
-
-{worker_b_text}
-
-Critic recommendation:
-{critic_text}
-
-Retrieved evidence:
-{evidence_text}
-
-Required output schema:
-{PromptTemplates._schema_hint_for_coordinator_output()}
-""".strip()
-
-    # ------------------------------------------------------------------
-    # Formatting helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def format_accessible_memory_context(
-        accessible_memory_context: str | None,
-    ) -> str:
-        """
-        Format accessible memory context for prompt input.
-
-        The input should already be permission-filtered.
-        """
-
-        if accessible_memory_context is None:
-            return "No accessible memory."
-
-        text = str(accessible_memory_context).strip()
-
-        if not text:
-            return "No accessible memory."
-
-        return text
-
-    @staticmethod
-    def format_retrieved_knowledge(
-        retrieved_knowledge: list[RetrievedKnowledge],
-        max_chars_per_chunk: int = 1200,
-    ) -> str:
-        """
-        Format retrieved chunks for prompt input.
-
-        Args:
-            retrieved_knowledge:
-                Retrieved chunks returned by ExternalKnowledgeRetriever.
-            max_chars_per_chunk:
-                Prevents very long contexts from making prompts too large.
-        """
-
-        if not retrieved_knowledge:
-            return "No retrieved evidence."
-
-        formatted_chunks: list[str] = []
-
-        for index, item in enumerate(retrieved_knowledge, start=1):
-            content = item.content.strip()
-
-            if len(content) > max_chars_per_chunk:
-                content = content[:max_chars_per_chunk].rstrip() + "..."
-
-            score_text = (
-                f"{item.score:.4f}"
-                if item.score is not None
-                else "N/A"
-            )
-
-            formatted_chunks.append(
-                "\n".join(
-                    [
-                        f"[Evidence {index}]",
-                        f"chunk_id: {item.chunk_id}",
-                        f"context_id: {item.context_id}",
-                        f"title: {item.title}",
-                        f"source: {item.source}",
-                        f"score: {score_text}",
-                        "content:",
-                        content,
-                    ]
-                )
-            )
-
-        return "\n\n".join(formatted_chunks)
-
-    @staticmethod
-    def format_agent_answer(
-        agent_name: str,
-        answer: AgentAnswer,
-    ) -> str:
-        """
-        Format an AgentAnswer for Critic / Coordinator prompts.
-        """
-
-        return "\n".join(
-            [
-                f"{agent_name}:",
-                f"answer: {answer.answer}",
-                f"reasoning: {answer.reasoning}",
-                f"confidence: {answer.confidence}",
-                f"evidence_chunk_ids: {answer.evidence_chunk_ids}",
-            ]
+    def worker(
+        *,
+        agent_id: str,
+        role_description: str | None = None,
+        additional_tasks: Sequence[str] | None = None,
+        additional_rules: Sequence[str] | None = None,
+    ) -> WorkerPromptTemplate:
+        return WorkerPromptTemplate(
+            agent_id=agent_id,
+            role_description=role_description,
+            additional_tasks=additional_tasks,
+            additional_rules=additional_rules,
         )
 
     @staticmethod
-    def format_critic_output(
-        critic_output: CriticOutput,
-    ) -> str:
-        """
-        Format CriticOutput for Coordinator prompt.
-        """
-
-        return "\n".join(
-            [
-                f"recommended_answer: {critic_output.recommended_answer}",
-                f"preferred_worker: {critic_output.preferred_worker}",
-                f"comment: {critic_output.comment}",
-                f"confidence: {critic_output.confidence}",
-            ]
-        )
-
-    # ------------------------------------------------------------------
-    # Schema hints
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _schema_hint_for_agent_answer() -> str:
-        """
-        Human-readable JSON schema hint for AgentAnswer.
-        """
-
-        return json.dumps(
-            {
-                "answer": "short answer span",
-                "reasoning": "brief reasoning",
-                "confidence": "float between 0.0 and 1.0",
-                "evidence_chunk_ids": [
-                    "chunk id used as evidence; empty list if no evidence"
-                ],
-            },
-            indent=2,
-            ensure_ascii=False,
+    def critic(
+        *,
+        critic_id: str = "critic",
+        additional_tasks: Sequence[str] | None = None,
+        additional_rules: Sequence[str] | None = None,
+    ) -> CriticPromptTemplate:
+        return CriticPromptTemplate(
+            critic_id=critic_id,
+            additional_tasks=additional_tasks,
+            additional_rules=additional_rules,
         )
 
     @staticmethod
-    def _schema_hint_for_critic_output() -> str:
-        """
-        Human-readable JSON schema hint for CriticOutput.
-        """
-
-        return json.dumps(
-            {
-                "recommended_answer": "short answer span",
-                "preferred_worker": "worker_a | worker_b | uncertain",
-                "comment": "brief critique explaining the recommendation",
-                "confidence": "float between 0.0 and 1.0",
-            },
-            indent=2,
-            ensure_ascii=False,
+    def coordinator(
+        *,
+        coordinator_id: str = "coordinator",
+        additional_tasks: Sequence[str] | None = None,
+        additional_rules: Sequence[str] | None = None,
+    ) -> CoordinatorPromptTemplate:
+        return CoordinatorPromptTemplate(
+            coordinator_id=coordinator_id,
+            additional_tasks=additional_tasks,
+            additional_rules=additional_rules,
         )
-
-    @staticmethod
-    def _schema_hint_for_coordinator_output() -> str:
-        """
-        Human-readable JSON schema hint for CoordinatorOutput.
-        """
-
-        return json.dumps(
-            {
-                "final_answer": "short answer span",
-                "reasoning": "brief explanation for the final decision",
-                "confidence": "float between 0.0 and 1.0",
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-
-
-# ----------------------------------------------------------------------
-# Optional functional wrappers
-# ----------------------------------------------------------------------
-
-def build_worker_a_prompt(
-    question: str,
-    accessible_memory_context: str | None = None,
-) -> str:
-    return PromptTemplates.build_worker_a_prompt(
-        question=question,
-        accessible_memory_context=accessible_memory_context,
-    )
-
-
-def build_worker_b_prompt(
-    question: str,
-    retrieved_knowledge: list[RetrievedKnowledge],
-    accessible_memory_context: str | None = None,
-) -> str:
-    return PromptTemplates.build_worker_b_prompt(
-        question=question,
-        retrieved_knowledge=retrieved_knowledge,
-        accessible_memory_context=accessible_memory_context,
-    )
-
-
-def build_critic_prompt(
-    question: str,
-    worker_a_output: AgentAnswer,
-    worker_b_output: AgentAnswer,
-    retrieved_knowledge: list[RetrievedKnowledge],
-    accessible_memory_context: str | None = None,
-) -> str:
-    return PromptTemplates.build_critic_prompt(
-        question=question,
-        worker_a_output=worker_a_output,
-        worker_b_output=worker_b_output,
-        retrieved_knowledge=retrieved_knowledge,
-        accessible_memory_context=accessible_memory_context,
-    )
-
-
-def build_coordinator_prompt(
-    question: str,
-    worker_a_output: AgentAnswer,
-    worker_b_output: AgentAnswer,
-    critic_output: CriticOutput,
-    retrieved_knowledge: list[RetrievedKnowledge],
-    accessible_memory_context: str | None = None,
-) -> str:
-    return PromptTemplates.build_coordinator_prompt(
-        question=question,
-        worker_a_output=worker_a_output,
-        worker_b_output=worker_b_output,
-        critic_output=critic_output,
-        retrieved_knowledge=retrieved_knowledge,
-        accessible_memory_context=accessible_memory_context,
-    )

@@ -2,81 +2,100 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Optional
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, TypeVar, cast
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from .output_schemas import (
     AgentAnswer,
-    CriticOutput,
-    CoordinatorOutput,
+    ExtractedMemory,
+    LLMCallMetadata,
+    MemoryExtractionOutput,
+    MemoryReviewOutput,
+    PromotionDecisionOutput,
+    TaskRoutingOutput,
 )
 
 
+SchemaT = TypeVar("SchemaT", bound=BaseModel)
+Normalizer = Callable[[dict[str, Any]], dict[str, Any]]
+
+
 class LLMOutputParseError(Exception):
-    """Raised when raw LLM output cannot be parsed into the expected schema."""
+    """
+    Raised when raw LLM output cannot be converted into the expected schema.
+    """
 
 
 class LLMOutputParser:
     """
-    Utility parser and normalizer for LLM outputs.
+    Generic parser and normalizer for structured LLM outputs.
 
-    Main responsibilities:
-    - normalize short answers for QA evaluation
-    - clamp confidence scores
-    - clean evidence chunk ids
-    - parse JSON-like raw LLM outputs as fallback
-    - convert raw dict/text into Pydantic output schemas
+    Responsibilities:
+    - extract a JSON object from raw LLM text;
+    - normalize common field types;
+    - apply schema-specific cleanup when needed;
+    - validate the result with a supplied Pydantic model.
 
-    This class does not call LLMs.
+    The parser is independent of any specific workflow, dataset, agent name,
+    prompt template, or LLM provider.
     """
 
-    # ------------------------------------------------------------------
-    # Answer normalization
-    # ------------------------------------------------------------------
-
     @staticmethod
-    def normalize_short_answer(answer: str) -> str:
+    def normalize_text(
+        value: Any,
+        *,
+        default: str = "",
+    ) -> str:
+        if value is None:
+            return default
+
+        text = str(value).strip()
+        return text if text else default
+
+    @classmethod
+    def normalize_optional_text(
+        cls,
+        value: Any,
+    ) -> str | None:
+        text = cls.normalize_text(value)
+        return text or None
+
+    @classmethod
+    def normalize_short_answer(
+        cls,
+        answer: Any,
+    ) -> str:
         """
-        Clean a short answer span returned by the LLM.
+        Remove common formatting artefacts from a short task answer.
 
-        This is not the same as SQuAD EM/F1 normalization.
-        It only removes common LLM formatting artifacts before evaluation.
-
-        Examples:
-            "The answer is Beyoncé." -> "Beyoncé"
-            '"in the late 1990s."' -> "in the late 1990s"
+        Dataset-specific EM/F1 normalization belongs in the evaluator.
         """
-
-        if answer is None:
-            return ""
-
-        text = str(answer).strip()
+        text = cls.normalize_text(answer)
 
         if not text:
             return ""
 
-        # Remove wrapping quotes.
         text = text.strip("\"'“”‘’")
 
-        # Remove common answer prefixes.
-        prefixes = [
+        prefixes = (
             r"^the answer is\s+",
             r"^answer:\s*",
             r"^final answer:\s*",
             r"^final_answer:\s*",
             r"^prediction:\s*",
-        ]
+        )
 
         for pattern in prefixes:
-            text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip()
+            text = re.sub(
+                pattern,
+                "",
+                text,
+                flags=re.IGNORECASE,
+            ).strip()
 
-        # Remove markdown bold markers.
         text = text.replace("**", "").strip()
-
-        # Remove trailing punctuation that often appears in generated answers.
-        # Keep punctuation that may be internal, e.g. "U.S."
-        text = text.strip()
 
         if len(text) > 1 and text[-1] in {".", "。"}:
             text = text[:-1].strip()
@@ -84,87 +103,124 @@ class LLMOutputParser:
         return text
 
     @staticmethod
-    def normalize_reasoning(reasoning: str) -> str:
-        """
-        Clean reasoning text.
-        """
-
-        if reasoning is None:
-            return ""
-
-        return str(reasoning).strip()
-
-    # ------------------------------------------------------------------
-    # Confidence normalization
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def clamp_confidence(confidence: Any, default: float = 0.5) -> float:
-        """
-        Convert confidence to float and clamp it to [0.0, 1.0].
-        """
-
+    def clamp_float(
+        value: Any,
+        *,
+        default: float,
+        minimum: float = 0.0,
+        maximum: float = 1.0,
+    ) -> float:
         try:
-            value = float(confidence)
+            number = float(value)
         except (TypeError, ValueError):
-            value = default
+            number = default
 
-        if value < 0.0:
-            return 0.0
+        return max(minimum, min(maximum, number))
 
-        if value > 1.0:
-            return 1.0
-
-        return value
-
-    # ------------------------------------------------------------------
-    # Evidence ID normalization
-    # ------------------------------------------------------------------
+    @classmethod
+    def clamp_confidence(
+        cls,
+        value: Any,
+        *,
+        default: float = 0.5,
+    ) -> float:
+        return cls.clamp_float(
+            value,
+            default=default,
+            minimum=0.0,
+            maximum=1.0,
+        )
 
     @staticmethod
-    def normalize_evidence_chunk_ids(
-        evidence_chunk_ids: Optional[list[Any]],
+    def normalize_bool(
+        value: Any,
+        *,
+        default: bool = False,
+    ) -> bool:
+        if isinstance(value, bool):
+            return value
+
+        if value is None:
+            return default
+
+        if isinstance(value, (int, float)):
+            return bool(value)
+
+        text = str(value).strip().lower()
+
+        if text in {"true", "yes", "y", "1", "on"}:
+            return True
+
+        if text in {"false", "no", "n", "0", "off"}:
+            return False
+
+        return default
+
+    @staticmethod
+    def normalize_choice(
+        value: Any,
+        *,
+        allowed: set[str],
+        default: str,
+        aliases: Mapping[str, str] | None = None,
+    ) -> str:
+        text = str(value).strip().lower() if value is not None else ""
+
+        if aliases and text in aliases:
+            text = aliases[text]
+
+        return text if text in allowed else default
+
+    @classmethod
+    def normalize_string_list(
+        cls,
+        values: Any,
     ) -> list[str]:
         """
-        Clean evidence chunk ids.
-
-        Removes:
-        - None
-        - empty strings
-        - duplicates
+        Convert a value into an ordered, deduplicated list of strings.
         """
-
-        if not evidence_chunk_ids:
+        if values is None:
             return []
+
+        if isinstance(values, str):
+            stripped = values.strip()
+
+            if not stripped:
+                return []
+
+            try:
+                decoded = json.loads(stripped)
+            except json.JSONDecodeError:
+                decoded = None
+
+            if isinstance(decoded, list):
+                values = decoded
+            else:
+                values = [stripped]
+
+        if not isinstance(values, Sequence) or isinstance(
+            values,
+            (bytes, bytearray),
+        ):
+            values = [values]
 
         cleaned: list[str] = []
 
-        for item in evidence_chunk_ids:
-            text = str(item).strip()
-
+        for item in values:
+            text = cls.normalize_text(item)
             if text and text not in cleaned:
                 cleaned.append(text)
 
         return cleaned
 
-    # ------------------------------------------------------------------
-    # JSON fallback parsing
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def extract_json_object(raw_output: str) -> dict[str, Any]:
+    @classmethod
+    def extract_json_object(
+        cls,
+        raw_output: str,
+    ) -> dict[str, Any]:
         """
-        Extract a JSON object from raw LLM text.
-
-        Supports:
-        - pure JSON string
-        - markdown fenced JSON block
-        - text containing one JSON object
-
-        Raises:
-            LLMOutputParseError if no valid JSON object can be parsed.
+        Extract the first valid JSON object from raw LLM text.
         """
-
         if raw_output is None:
             raise LLMOutputParseError("Raw output is None.")
 
@@ -173,233 +229,423 @@ class LLMOutputParser:
         if not text:
             raise LLMOutputParseError("Raw output is empty.")
 
-        # Remove fenced code block if present.
         fenced_match = re.search(
-            r"```(?:json)?\s*(\{.*?\})\s*```",
+            r"```(?:json)?\s*(.*?)\s*```",
             text,
             flags=re.DOTALL | re.IGNORECASE,
         )
 
         if fenced_match:
-            text = fenced_match.group(1).strip()
+            fenced_text = fenced_match.group(1).strip()
+            try:
+                parsed = json.loads(fenced_text)
+            except json.JSONDecodeError:
+                pass
+            else:
+                if isinstance(parsed, dict):
+                    return cast(dict[str, Any], parsed)
 
-        # Try direct JSON parse.
         try:
             parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                return parsed
         except json.JSONDecodeError:
-            pass
+            parsed = None
 
-        # Try extracting first {...} object.
-        object_match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if isinstance(parsed, dict):
+            return cast(dict[str, Any], parsed)
 
-        if object_match:
-            json_text = object_match.group(0)
+        decoder = json.JSONDecoder()
+
+        for index, character in enumerate(text):
+            if character != "{":
+                continue
 
             try:
-                parsed = json.loads(json_text)
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError as error:
-                raise LLMOutputParseError(
-                    f"Found JSON-like object but failed to parse it: {error}"
-                ) from error
+                parsed, _ = decoder.raw_decode(text[index:])
+            except json.JSONDecodeError:
+                continue
 
-        raise LLMOutputParseError("Could not extract a valid JSON object.")
+            if isinstance(parsed, dict):
+                return cast(dict[str, Any], parsed)
 
-    # ------------------------------------------------------------------
-    # Schema normalization helpers
-    # ------------------------------------------------------------------
+        raise LLMOutputParseError(
+            "Could not extract a valid JSON object from the LLM output."
+        )
+
+    @classmethod
+    def to_mapping(
+        cls,
+        raw_output: str | Mapping[str, Any] | BaseModel,
+    ) -> dict[str, Any]:
+        if isinstance(raw_output, BaseModel):
+            return dict(raw_output.model_dump())
+
+        if isinstance(raw_output, Mapping):
+            return dict(raw_output)
+
+        return cls.extract_json_object(raw_output)
 
     @classmethod
     def normalize_agent_answer_dict(
         cls,
         data: dict[str, Any],
     ) -> dict[str, Any]:
-        """
-        Normalize raw dict fields for AgentAnswer.
-        """
-
         return {
-            "answer": cls.normalize_short_answer(data.get("answer", "")),
-            "reasoning": cls.normalize_reasoning(data.get("reasoning", "")),
-            "confidence": cls.clamp_confidence(data.get("confidence", 0.5)),
-            "evidence_chunk_ids": cls.normalize_evidence_chunk_ids(
-                data.get("evidence_chunk_ids", [])
+            "answer": cls.normalize_short_answer(data.get("answer")),
+            "reasoning": cls.normalize_text(data.get("reasoning")),
+            "confidence": cls.clamp_confidence(data.get("confidence")),
+            "used_memory_ids": cls.normalize_string_list(
+                data.get("used_memory_ids")
+            ),
+            "supporting_source_ids": cls.normalize_string_list(
+                data.get("supporting_source_ids")
+            ),
+            "contributing_agent_ids": cls.normalize_string_list(
+                data.get("contributing_agent_ids")
             ),
         }
 
     @classmethod
-    def normalize_critic_output_dict(
+    def normalize_extracted_memory_dict(
         cls,
         data: dict[str, Any],
     ) -> dict[str, Any]:
-        """
-        Normalize raw dict fields for CriticOutput.
-        """
-
-        preferred_worker = str(
-            data.get("preferred_worker", "uncertain")
-        ).strip().lower()
-
-        if preferred_worker not in {"worker_a", "worker_b", "uncertain"}:
-            preferred_worker = "uncertain"
-
         return {
-            "recommended_answer": cls.normalize_short_answer(
-                data.get("recommended_answer", "")
+            "content": cls.normalize_text(data.get("content")),
+            "subject": cls.normalize_optional_text(data.get("subject")),
+            "memory_type": cls.normalize_choice(
+                data.get("memory_type"),
+                allowed={"semantic", "episodic", "procedural"},
+                default="semantic",
             ),
-            "preferred_worker": preferred_worker,
-            "comment": cls.normalize_reasoning(data.get("comment", "")),
-            "confidence": cls.clamp_confidence(data.get("confidence", 0.5)),
+            "source_ids": cls.normalize_string_list(data.get("source_ids")),
+            "importance": cls.clamp_float(
+                data.get("importance"),
+                default=0.5,
+            ),
+            "shareable": cls.normalize_bool(
+                data.get("shareable"),
+                default=True,
+            ),
+            "confidence": cls.clamp_confidence(data.get("confidence")),
         }
 
     @classmethod
-    def normalize_coordinator_output_dict(
+    def normalize_memory_extraction_output_dict(
         cls,
         data: dict[str, Any],
     ) -> dict[str, Any]:
-        """
-        Normalize raw dict fields for CoordinatorOutput.
-        """
+        raw_memories = data.get("memories", [])
 
-        # Support both final_answer and answer as fallback.
-        final_answer = data.get("final_answer", data.get("answer", ""))
+        if isinstance(raw_memories, Mapping):
+            raw_memories = [raw_memories]
+
+        normalized_memories: list[dict[str, Any]] = []
+
+        if isinstance(raw_memories, Sequence) and not isinstance(
+            raw_memories,
+            (str, bytes, bytearray),
+        ):
+            for item in raw_memories:
+                if isinstance(item, BaseModel):
+                    item = item.model_dump()
+
+                if isinstance(item, Mapping):
+                    normalized_memories.append(
+                        cls.normalize_extracted_memory_dict(dict(item))
+                    )
 
         return {
-            "final_answer": cls.normalize_short_answer(final_answer),
-            "reasoning": cls.normalize_reasoning(data.get("reasoning", "")),
-            "confidence": cls.clamp_confidence(data.get("confidence", 0.5)),
+            "agent_id": cls.normalize_text(data.get("agent_id")),
+            "memories": normalized_memories,
+            "extraction_summary": cls.normalize_optional_text(
+                data.get("extraction_summary")
+            ),
         }
 
-    # ------------------------------------------------------------------
-    # Parse into Pydantic schemas
-    # ------------------------------------------------------------------
+    @classmethod
+    def normalize_memory_review_output_dict(
+        cls,
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "memory_id": cls.normalize_text(data.get("memory_id")),
+            "classification": cls.normalize_choice(
+                data.get("classification"),
+                allowed={
+                    "new",
+                    "duplicate",
+                    "conflict",
+                    "outdated",
+                    "irrelevant",
+                    "policy_violation",
+                    "uncertain",
+                },
+                default="uncertain",
+                aliases={
+                    "policy violation": "policy_violation",
+                    "policy-violation": "policy_violation",
+                },
+            ),
+            "recommendation": cls.normalize_choice(
+                data.get("recommendation"),
+                allowed={
+                    "approve",
+                    "reject",
+                    "merge",
+                    "supersede",
+                    "keep_private",
+                },
+                default="reject",
+                aliases={
+                    "keep private": "keep_private",
+                    "keep-private": "keep_private",
+                },
+            ),
+            "relevant": cls.normalize_bool(
+                data.get("relevant"),
+                default=False,
+            ),
+            "policy_compliant": cls.normalize_bool(
+                data.get("policy_compliant"),
+                default=False,
+            ),
+            "related_memory_ids": cls.normalize_string_list(
+                data.get("related_memory_ids")
+            ),
+            "reason": cls.normalize_text(data.get("reason")),
+            "confidence": cls.clamp_confidence(data.get("confidence")),
+        }
+
+    @classmethod
+    def normalize_task_routing_output_dict(
+        cls,
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        selected_agent_ids = cls.normalize_string_list(
+            data.get("selected_agent_ids")
+        )
+        responder_agent_id = cls.normalize_text(
+            data.get("responder_agent_id")
+        )
+
+        if responder_agent_id and responder_agent_id not in selected_agent_ids:
+            selected_agent_ids.append(responder_agent_id)
+
+        return {
+            "selected_agent_ids": selected_agent_ids,
+            "responder_agent_id": responder_agent_id,
+            "required_information": cls.normalize_string_list(
+                data.get("required_information")
+            ),
+            "reason": cls.normalize_text(data.get("reason")),
+            "confidence": cls.clamp_confidence(data.get("confidence")),
+        }
+
+    @classmethod
+    def normalize_promotion_decision_output_dict(
+        cls,
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        decision = cls.normalize_choice(
+            data.get("decision"),
+            allowed={
+                "approve",
+                "reject",
+                "merge",
+                "supersede",
+                "keep_private",
+            },
+            default="reject",
+            aliases={
+                "keep private": "keep_private",
+                "keep-private": "keep_private",
+            },
+        )
+
+        default_scope = (
+            "private"
+            if decision in {"reject", "keep_private"}
+            else "shared"
+        )
+
+        target_scope = cls.normalize_choice(
+            data.get("target_scope"),
+            allowed={"private", "shared"},
+            default=default_scope,
+        )
+
+        allowed_agent_ids = cls.normalize_string_list(
+            data.get("allowed_agent_ids")
+        )
+
+        if decision in {"reject", "keep_private"}:
+            target_scope = "private"
+
+        if target_scope == "private":
+            allowed_agent_ids = []
+
+        return {
+            "memory_id": cls.normalize_text(data.get("memory_id")),
+            "decision": decision,
+            "target_scope": target_scope,
+            "allowed_agent_ids": allowed_agent_ids,
+            "related_memory_ids": cls.normalize_string_list(
+                data.get("related_memory_ids")
+            ),
+            "reason": cls.normalize_text(data.get("reason")),
+            "confidence": cls.clamp_confidence(data.get("confidence")),
+        }
+
+    @classmethod
+    def normalize_llm_call_metadata_dict(
+        cls,
+        data: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "agent_id": cls.normalize_text(data.get("agent_id")),
+            "role": cls.normalize_optional_text(data.get("role")),
+            "model_name": cls.normalize_text(data.get("model_name")),
+            "prompt_preview": cls.normalize_optional_text(
+                data.get("prompt_preview")
+            ),
+            "raw_output": cls.normalize_optional_text(
+                data.get("raw_output")
+            ),
+            "success": cls.normalize_bool(
+                data.get("success"),
+                default=True,
+            ),
+            "error_message": cls.normalize_optional_text(
+                data.get("error_message")
+            ),
+            "latency_ms": (
+                None
+                if data.get("latency_ms") is None
+                else max(0.0, float(data.get("latency_ms")))
+            ),
+            "input_tokens": (
+                None
+                if data.get("input_tokens") is None
+                else max(0, int(data.get("input_tokens")))
+            ),
+            "output_tokens": (
+                None
+                if data.get("output_tokens") is None
+                else max(0, int(data.get("output_tokens")))
+            ),
+        }
+
+    @classmethod
+    def get_normalizer(
+        cls,
+        schema_model: type[SchemaT],
+    ) -> Normalizer | None:
+        normalizers: dict[type[BaseModel], Normalizer] = {
+            AgentAnswer: cls.normalize_agent_answer_dict,
+            ExtractedMemory: cls.normalize_extracted_memory_dict,
+            MemoryExtractionOutput: (
+                cls.normalize_memory_extraction_output_dict
+            ),
+            MemoryReviewOutput: cls.normalize_memory_review_output_dict,
+            TaskRoutingOutput: cls.normalize_task_routing_output_dict,
+            PromotionDecisionOutput: (
+                cls.normalize_promotion_decision_output_dict
+            ),
+            LLMCallMetadata: cls.normalize_llm_call_metadata_dict,
+        }
+
+        return normalizers.get(schema_model)
+
+    @classmethod
+    def parse_as(
+        cls,
+        raw_output: str | Mapping[str, Any] | BaseModel,
+        schema_model: type[SchemaT],
+        *,
+        normalizer: Normalizer | None = None,
+        apply_default_normalizer: bool = True,
+    ) -> SchemaT:
+        """
+        Parse raw output into any supplied Pydantic schema.
+        """
+        data = cls.to_mapping(raw_output)
+
+        selected_normalizer = normalizer
+
+        if selected_normalizer is None and apply_default_normalizer:
+            selected_normalizer = cls.get_normalizer(schema_model)
+
+        if selected_normalizer is not None:
+            data = selected_normalizer(data)
+
+        try:
+            return schema_model.model_validate(data)
+        except ValidationError as error:
+            raw_preview = cls.normalize_text(raw_output)[:500]
+
+            raise LLMOutputParseError(
+                f"Failed to parse {schema_model.__name__}: {error}. "
+                f"Raw output preview: {raw_preview!r}"
+            ) from error
+
+    @classmethod
+    def clean_model(
+        cls,
+        model: SchemaT,
+    ) -> SchemaT:
+        """
+        Re-normalize and revalidate an already structured Pydantic output.
+        """
+        return cls.parse_as(
+            model,
+            cast(type[SchemaT], type(model)),
+        )
 
     @classmethod
     def parse_agent_answer(
         cls,
-        raw_output: str | dict[str, Any],
+        raw_output: str | Mapping[str, Any] | BaseModel,
     ) -> AgentAnswer:
-        """
-        Parse raw output into AgentAnswer.
-        """
-
-        data = (
-            raw_output
-            if isinstance(raw_output, dict)
-            else cls.extract_json_object(raw_output)
-        )
-
-        normalized = cls.normalize_agent_answer_dict(data)
-
-        try:
-            return AgentAnswer.model_validate(normalized)
-        except ValidationError as error:
-            raise LLMOutputParseError(
-                f"Failed to parse AgentAnswer: {error}"
-            ) from error
+        return cls.parse_as(raw_output, AgentAnswer)
 
     @classmethod
-    def parse_critic_output(
+    def parse_extracted_memory(
         cls,
-        raw_output: str | dict[str, Any],
-    ) -> CriticOutput:
-        """
-        Parse raw output into CriticOutput.
-        """
-
-        data = (
-            raw_output
-            if isinstance(raw_output, dict)
-            else cls.extract_json_object(raw_output)
-        )
-
-        normalized = cls.normalize_critic_output_dict(data)
-
-        try:
-            return CriticOutput.model_validate(normalized)
-        except ValidationError as error:
-            raise LLMOutputParseError(
-                f"Failed to parse CriticOutput: {error}"
-            ) from error
+        raw_output: str | Mapping[str, Any] | BaseModel,
+    ) -> ExtractedMemory:
+        return cls.parse_as(raw_output, ExtractedMemory)
 
     @classmethod
-    def parse_coordinator_output(
+    def parse_memory_extraction_output(
         cls,
-        raw_output: str | dict[str, Any],
-    ) -> CoordinatorOutput:
-        """
-        Parse raw output into CoordinatorOutput.
-        """
-
-        data = (
-            raw_output
-            if isinstance(raw_output, dict)
-            else cls.extract_json_object(raw_output)
-        )
-
-        normalized = cls.normalize_coordinator_output_dict(data)
-
-        try:
-            return CoordinatorOutput.model_validate(normalized)
-        except ValidationError as error:
-            raise LLMOutputParseError(
-                f"Failed to parse CoordinatorOutput: {error}"
-            ) from error
-
-    # ------------------------------------------------------------------
-    # Post-process already structured outputs
-    # ------------------------------------------------------------------
+        raw_output: str | Mapping[str, Any] | BaseModel,
+    ) -> MemoryExtractionOutput:
+        return cls.parse_as(raw_output, MemoryExtractionOutput)
 
     @classmethod
-    def clean_agent_answer(
+    def parse_memory_review_output(
         cls,
-        answer: AgentAnswer,
-    ) -> AgentAnswer:
-        """
-        Clean an AgentAnswer returned by structured output.
-        """
-
-        return AgentAnswer(
-            answer=cls.normalize_short_answer(answer.answer),
-            reasoning=cls.normalize_reasoning(answer.reasoning),
-            confidence=cls.clamp_confidence(answer.confidence),
-            evidence_chunk_ids=cls.normalize_evidence_chunk_ids(
-                answer.evidence_chunk_ids
-            ),
-        )
+        raw_output: str | Mapping[str, Any] | BaseModel,
+    ) -> MemoryReviewOutput:
+        return cls.parse_as(raw_output, MemoryReviewOutput)
 
     @classmethod
-    def clean_critic_output(
+    def parse_task_routing_output(
         cls,
-        output: CriticOutput,
-    ) -> CriticOutput:
-        """
-        Clean a CriticOutput returned by structured output.
-        """
-
-        return CriticOutput(
-            recommended_answer=cls.normalize_short_answer(
-                output.recommended_answer
-            ),
-            preferred_worker=output.preferred_worker,
-            comment=cls.normalize_reasoning(output.comment),
-            confidence=cls.clamp_confidence(output.confidence),
-        )
+        raw_output: str | Mapping[str, Any] | BaseModel,
+    ) -> TaskRoutingOutput:
+        return cls.parse_as(raw_output, TaskRoutingOutput)
 
     @classmethod
-    def clean_coordinator_output(
+    def parse_promotion_decision_output(
         cls,
-        output: CoordinatorOutput,
-    ) -> CoordinatorOutput:
-        """
-        Clean a CoordinatorOutput returned by structured output.
-        """
+        raw_output: str | Mapping[str, Any] | BaseModel,
+    ) -> PromotionDecisionOutput:
+        return cls.parse_as(raw_output, PromotionDecisionOutput)
 
-        return CoordinatorOutput(
-            final_answer=cls.normalize_short_answer(output.final_answer),
-            reasoning=cls.normalize_reasoning(output.reasoning),
-            confidence=cls.clamp_confidence(output.confidence),
-        )
+    @classmethod
+    def parse_llm_call_metadata(
+        cls,
+        raw_output: str | Mapping[str, Any] | BaseModel,
+    ) -> LLMCallMetadata:
+        return cls.parse_as(raw_output, LLMCallMetadata)
