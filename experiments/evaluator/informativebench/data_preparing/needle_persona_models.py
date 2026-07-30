@@ -50,6 +50,152 @@ def _clean_string_list(values: list[str]) -> list[str]:
     return cleaned
 
 
+from typing import Literal
+
+from pydantic import (
+    BaseModel,
+    Field,
+    field_validator,
+    model_validator,
+)
+
+
+ContributionType = Literal[
+    "direct_answer",
+    "partial_hop",
+    "context_only",
+    "none",
+]
+
+
+class NeedleEvidenceAssessment(BaseModel):
+    """
+    Critic assessment of one candidate memory's incremental
+    contribution to the active benchmark question.
+
+    This model does not make a governance decision.
+    """
+
+    memory_id: str = Field(
+        description=(
+            "Exact ID of the candidate memory."
+        )
+    )
+
+    contribution_type: ContributionType = Field(
+        description=(
+            "How the candidate contributes to answering "
+            "the active question."
+        )
+    )
+
+    supported_question_component: str | None = Field(
+        default=None,
+        description=(
+            "The specific part of the question supported "
+            "by this candidate."
+        ),
+    )
+
+    evidence_spans: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Exact short spans from the candidate memory "
+            "that provide the contribution."
+        ),
+    )
+
+    reason: str = Field(
+        description=(
+            "Concise explanation of the evidence "
+            "contribution assessment."
+        )
+    )
+
+    confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+    )
+
+    @field_validator(
+        "memory_id",
+        "reason",
+    )
+    @classmethod
+    def required_text(
+        cls,
+        value: str,
+    ) -> str:
+        cleaned = str(value).strip()
+
+        if not cleaned:
+            raise ValueError(
+                "Required text cannot be empty."
+            )
+
+        return cleaned
+
+    @field_validator(
+        "supported_question_component",
+    )
+    @classmethod
+    def clean_optional_text(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        if value is None:
+            return None
+
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    @field_validator(
+        "evidence_spans",
+    )
+    @classmethod
+    def clean_evidence_spans(
+        cls,
+        values: list[str],
+    ) -> list[str]:
+        cleaned: list[str] = []
+
+        for value in values:
+            text = str(value).strip()
+
+            if text and text not in cleaned:
+                cleaned.append(text)
+
+        return cleaned
+
+    @model_validator(mode="after")
+    def validate_contribution(
+        self,
+    ) -> "NeedleEvidenceAssessment":
+        useful_types = {
+            "direct_answer",
+            "partial_hop",
+        }
+
+        if self.contribution_type in useful_types:
+            if not self.supported_question_component:
+                raise ValueError(
+                    "A useful contribution requires "
+                    "supported_question_component."
+                )
+
+            if not self.evidence_spans:
+                raise ValueError(
+                    "A useful contribution requires at "
+                    "least one evidence span."
+                )
+
+        if self.contribution_type == "none":
+            self.supported_question_component = None
+            self.evidence_spans = []
+
+        return self
+
 class PersonaSource(BaseModel):
     """
     One source item owned by a persona agent.

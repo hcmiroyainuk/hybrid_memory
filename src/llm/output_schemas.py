@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
-_ABSTENTION_ANSWER = "INSUFFICIENT_EVIDENCE"
 
 def _clean_string_list(values: list[str]) -> list[str]:
     """
@@ -20,97 +25,192 @@ def _clean_string_list(values: list[str]) -> list[str]:
     return cleaned
 
 
+AnswerStatus = Literal[
+    "answered",
+    "insufficient_evidence",
+    "refused",
+]
+
+
 class AgentAnswer(BaseModel):
     """
-    Generic structured answer produced by any task-oriented agent.
+    Structured outcome produced by a task-oriented agent.
 
-    This schema is intentionally independent of a specific workflow or persona.
-    It can be used by Alice, Bob, Charlie, Dave, or any future task agent.
+    The schema explicitly distinguishes a successful answer from an
+    evidence-based abstention or a refusal. An empty string is never used as an
+    implicit status signal.
+
+    Workflow-level code remains responsible for checking that referenced
+    memories exist, are accessible to the responder, and map to the declared
+    source and contributing-agent identifiers.
     """
 
-    answer: str = Field(
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["2.0"] = Field(
+        default="2.0",
+        description="Version of the AgentAnswer data contract.",
+    )
+
+    status: AnswerStatus = Field(
         description=(
-            "Final answer items only. "
-            "For multiple items, use a comma followed by one space, "
-            "preserve the order of the corresponding subjects in the question, "
-            "and do not include explanations, labels, prefixes, bullets, "
-            "quotation marks, brackets, or full sentences."
+            "Outcome of the answering attempt. Use 'answered' only when the "
+            "accessible evidence supports a final answer; use "
+            "'insufficient_evidence' when required information is unavailable; "
+            "use 'refused' only when the task must not be answered."
         )
     )
 
+    answer: str | None = Field(
+        default=None,
+        description=(
+            "Final answer items only when status='answered'. For multiple "
+            "items, use a comma followed by one space and preserve the order of "
+            "the corresponding subjects in the question. Do not include "
+            "explanations, labels, prefixes, bullets, quotation marks, brackets, "
+            "or full sentences. Must be null for non-answer statuses."
+        ),
+    )
+
     reasoning: str = Field(
-        description="Brief explanation grounded in the available evidence."
+        description=(
+            "Brief rationale for the selected status. For 'answered', explain "
+            "how the accessible evidence supports the answer. For "
+            "'insufficient_evidence', explain why the available evidence is "
+            "incomplete. For 'refused', explain the refusal."
+        )
     )
 
     confidence: float = Field(
         default=0.5,
         ge=0.0,
         le=1.0,
-        description="Confidence score between 0.0 and 1.0.",
+        description=(
+            "Confidence in the selected status and its associated content, "
+            "between 0.0 and 1.0. For 'answered', this is confidence in the "
+            "answer; otherwise, it is confidence in the abstention or refusal."
+        ),
+    )
+
+    missing_information: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Specific information still required to answer the task. This must "
+            "be non-empty only when status='insufficient_evidence'."
+        ),
     )
 
     used_memory_ids: list[str] = Field(
         default_factory=list,
-        description="IDs of private or shared memories actually used to produce the answer.",
+        description=(
+            "Exact IDs of accessible private or shared memories materially used "
+            "in the response. These identifiers must be validated by the "
+            "workflow against the current run and responder permissions."
+        ),
     )
 
     supporting_source_ids: list[str] = Field(
         default_factory=list,
-        description="Optional IDs of external documents, chunks, messages, or tool results used as evidence.",
+        description=(
+            "Exact source identifiers associated with the used memories. These "
+            "are retained for compatibility and must be verified or derived "
+            "deterministically by workflow-level code."
+        ),
     )
 
     contributing_agent_ids: list[str] = Field(
         default_factory=list,
-        description="IDs of agents whose memories or contributions were used.",
+        description=(
+            "Exact agent identifiers associated with the used memories. These "
+            "are retained for compatibility and must be verified or derived "
+            "deterministically by workflow-level code."
+        ),
     )
 
-    @field_validator(
-        "answer",
-        mode="before",
-    )
+    @field_validator("answer", mode="before")
     @classmethod
-    def clean_answer(
-            cls,
-            value: str | None,
-    ) -> str:
-        """
-        Convert an unsupported empty answer into an explicit abstention.
+    def clean_optional_answer(cls, value: Any) -> str | None:
+        if value is None:
+            return None
 
-        An abstention remains an incorrect benchmark prediction, but it must not
-        abort the complete sample-mode evaluation run.
-        """
-        text = " ".join(
-            str(value or "").split()
-        )
+        text = " ".join(str(value).split())
+        return text or None
 
-        return text or _ABSTENTION_ANSWER
-
-    @field_validator(
-        "reasoning",
-        mode="before",
-    )
+    @field_validator("reasoning", mode="before")
     @classmethod
-    def clean_reasoning(
-            cls,
-            value: str | None,
-    ) -> str:
-        text = " ".join(
-            str(value or "").split()
-        )
+    def reasoning_must_not_be_empty(cls, value: Any) -> str:
+        text = " ".join(str(value or "").split())
 
-        return (
-                text
-                or "No supported answer was found in the accessible evidence."
-        )
+        if not text:
+            raise ValueError("reasoning cannot be empty.")
+
+        return text
 
     @field_validator(
+        "missing_information",
         "used_memory_ids",
         "supporting_source_ids",
         "contributing_agent_ids",
+        mode="before",
     )
     @classmethod
-    def clean_identifier_lists(cls, value: list[str]) -> list[str]:
+    def clean_string_lists(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+
+        if not isinstance(value, list):
+            raise TypeError("Identifier and information fields must be lists.")
+
         return _clean_string_list(value)
+
+    @model_validator(mode="after")
+    def validate_status_contract(self) -> "AgentAnswer":
+        if self.status == "answered":
+            if self.answer is None:
+                raise ValueError(
+                    "answer must be non-empty when status='answered'."
+                )
+
+            if self.missing_information:
+                raise ValueError(
+                    "missing_information must be empty when status='answered'."
+                )
+
+            return self
+
+        if self.answer is not None:
+            raise ValueError(
+                "answer must be null when status is not 'answered'."
+            )
+
+        if self.status == "insufficient_evidence":
+            if not self.missing_information:
+                raise ValueError(
+                    "missing_information must be non-empty when "
+                    "status='insufficient_evidence'."
+                )
+
+            return self
+
+        if self.status == "refused":
+            if self.missing_information:
+                raise ValueError(
+                    "missing_information must be empty when status='refused'."
+                )
+
+            if (
+                self.used_memory_ids
+                or self.supporting_source_ids
+                or self.contributing_agent_ids
+            ):
+                raise ValueError(
+                    "Evidence identifier fields must be empty when "
+                    "status='refused'."
+                )
+
+            return self
+
+        raise ValueError(f"Unsupported answer status: {self.status!r}.")
 
 
 class ExtractedMemory(BaseModel):

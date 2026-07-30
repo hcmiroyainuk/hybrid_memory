@@ -266,18 +266,6 @@ class NeedlePersonaIngestionService:
                         prompt_template=prompt_template,
                     )
 
-                    if (
-                            self.require_memory_per_source
-                            and not extracted.memories
-                    ):
-                        raise NeedlePersonaIngestionError(
-                            "The source produced no memory candidates",
-                            run_id=run_id,
-                            sample_id=sample.sample_id,
-                            agent_id=current_agent_id,
-                            source_id=source.source_id,
-                        )
-
                     candidates = self._prepare_candidates(
                         extraction=extracted,
                         expected_agent_id=current_agent_id,
@@ -286,6 +274,18 @@ class NeedlePersonaIngestionService:
                             current_agent_id
                         ],
                     )
+
+                    if (
+                        self.require_memory_per_source
+                        and not candidates
+                    ):
+                        raise NeedlePersonaIngestionError(
+                            "The source produced no valid memory candidates",
+                            run_id=run_id,
+                            sample_id=sample.sample_id,
+                            agent_id=current_agent_id,
+                            source_id=source.source_id,
+                        )
 
                     source_memory_ids: list[str] = []
 

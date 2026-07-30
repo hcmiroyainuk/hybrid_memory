@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
-from .needle_persona_models import (
+from experiments.evaluator.informativebench.data_preparing.needle_persona_models import (
     PERSONA_NAMES,
     NeedlePersonaSample,
     PersonaName,

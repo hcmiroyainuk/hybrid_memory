@@ -22,6 +22,61 @@ SchemaT = TypeVar("SchemaT", bound=BaseModel)
 Normalizer = Callable[[dict[str, Any]], dict[str, Any]]
 
 
+_AGENT_ANSWER_SCHEMA_VERSION = "2.0"
+
+_ANSWER_STATUS_ALIASES: dict[str, str] = {
+    "answer": "answered",
+    "answered": "answered",
+    "complete": "answered",
+    "completed": "answered",
+    "success": "answered",
+    "successful": "answered",
+    "insufficient": "insufficient_evidence",
+    "insufficient evidence": "insufficient_evidence",
+    "insufficient-evidence": "insufficient_evidence",
+    "insufficient_evidence": "insufficient_evidence",
+    "abstain": "insufficient_evidence",
+    "abstained": "insufficient_evidence",
+    "no answer": "insufficient_evidence",
+    "no-answer": "insufficient_evidence",
+    "no_answer": "insufficient_evidence",
+    "cannot answer": "insufficient_evidence",
+    "cannot-answer": "insufficient_evidence",
+    "cannot_answer": "insufficient_evidence",
+    "refuse": "refused",
+    "refused": "refused",
+    "refusal": "refused",
+}
+
+_ABSTENTION_SENTINELS = frozenset(
+    {
+        "insufficient_evidence",
+        "insufficient evidence",
+        "no answer",
+        "no_answer",
+        "unknown",
+        "cannot determine",
+        "cannot answer",
+        "not enough information",
+        "not enough evidence",
+    }
+)
+
+_REFUSAL_SENTINELS = frozenset(
+    {
+        "refused",
+        "refuse",
+        "i refuse",
+        "cannot comply",
+        "i cannot comply",
+    }
+)
+
+_LEGACY_MISSING_INFORMATION = (
+    "Sufficient accessible evidence to answer the question."
+)
+
+
 class LLMOutputParseError(Exception):
     """
     Raised when raw LLM output cannot be converted into the expected schema.
@@ -101,6 +156,79 @@ class LLMOutputParser:
             text = text[:-1].strip()
 
         return text
+
+    @classmethod
+    def normalize_optional_short_answer(
+        cls,
+        answer: Any,
+    ) -> str | None:
+        """
+        Normalize a final answer while preserving the absence of an answer.
+        """
+        text = cls.normalize_short_answer(answer)
+        return text or None
+
+    @classmethod
+    def normalize_answer_status(
+        cls,
+        value: Any,
+    ) -> str:
+        """
+        Normalize common status aliases without concealing unknown values.
+
+        Unknown non-empty values are returned in normalized form so that the
+        Pydantic Literal validation can reject them explicitly.
+        """
+        text = cls.normalize_text(value).lower()
+        text = re.sub(r"\s+", " ", text).strip()
+
+        if not text:
+            return ""
+
+        return _ANSWER_STATUS_ALIASES.get(text, text)
+
+    @classmethod
+    def normalize_schema_version(
+        cls,
+        value: Any,
+    ) -> str:
+        text = cls.normalize_text(
+            value,
+            default=_AGENT_ANSWER_SCHEMA_VERSION,
+        ).lower()
+
+        if text in {"2", "2.0", "v2", "v2.0"}:
+            return _AGENT_ANSWER_SCHEMA_VERSION
+
+        return text
+
+    @classmethod
+    def is_abstention_answer(
+        cls,
+        answer: str | None,
+    ) -> bool:
+        if answer is None:
+            return True
+
+        normalized = cls.normalize_text(answer).lower()
+        normalized = normalized.strip("\"\'“”‘’ .。")
+        normalized = re.sub(r"\s+", " ", normalized)
+
+        return normalized in _ABSTENTION_SENTINELS
+
+    @classmethod
+    def is_refusal_answer(
+        cls,
+        answer: str | None,
+    ) -> bool:
+        if answer is None:
+            return False
+
+        normalized = cls.normalize_text(answer).lower()
+        normalized = normalized.strip("\"\'“”‘’ .。")
+        normalized = re.sub(r"\s+", " ", normalized)
+
+        return normalized in _REFUSAL_SENTINELS
 
     @staticmethod
     def clamp_float(
@@ -289,20 +417,129 @@ class LLMOutputParser:
         cls,
         data: dict[str, Any],
     ) -> dict[str, Any]:
-        return {
-            "answer": cls.normalize_short_answer(data.get("answer")),
-            "reasoning": cls.normalize_text(data.get("reasoning")),
-            "confidence": cls.clamp_confidence(data.get("confidence")),
-            "used_memory_ids": cls.normalize_string_list(
-                data.get("used_memory_ids")
-            ),
-            "supporting_source_ids": cls.normalize_string_list(
-                data.get("supporting_source_ids")
-            ),
-            "contributing_agent_ids": cls.normalize_string_list(
-                data.get("contributing_agent_ids")
-            ),
-        }
+        """
+        Normalize AgentAnswer v2 while preserving semantic contradictions.
+
+        Compatibility behaviour is deliberately limited:
+        - when a legacy output has no status, status is inferred from answer;
+        - legacy evidence_chunk_ids are mapped to supporting_source_ids;
+        - a legacy empty/sentinel answer becomes an explicit
+          insufficient_evidence result.
+
+        When status is explicitly supplied, the parser does not silently change
+        an incompatible status, concrete answer, or evidence declaration. The
+        AgentAnswer model validator remains responsible for rejecting those
+        contradictions.
+        """
+        normalized = dict(data)
+
+        raw_answer = data.get(
+            "answer",
+            data.get("final_answer"),
+        )
+        answer = cls.normalize_optional_short_answer(raw_answer)
+        reasoning = cls.normalize_text(data.get("reasoning"))
+
+        raw_status = data.get("status")
+        status_was_supplied = bool(cls.normalize_text(raw_status))
+
+        missing_information = cls.normalize_string_list(
+            data.get(
+                "missing_information",
+                data.get(
+                    "missing_evidence",
+                    data.get("required_information"),
+                ),
+            )
+        )
+
+        supporting_source_ids = cls.normalize_string_list(
+            data.get(
+                "supporting_source_ids",
+                data.get("evidence_chunk_ids"),
+            )
+        )
+        used_memory_ids = cls.normalize_string_list(
+            data.get("used_memory_ids")
+        )
+        contributing_agent_ids = cls.normalize_string_list(
+            data.get("contributing_agent_ids")
+        )
+
+        if status_was_supplied:
+            status = cls.normalize_answer_status(raw_status)
+
+            # Sentinel strings are not concrete answers. Converting only the
+            # sentinel to None allows the schema to expose an explicit status
+            # contradiction instead of accepting the sentinel as an answer.
+            if (
+                cls.is_abstention_answer(answer)
+                or cls.is_refusal_answer(answer)
+            ):
+                answer = None
+        else:
+            # Backward-compatible migration from AgentAnswer v1.
+            if cls.is_refusal_answer(answer):
+                status = "refused"
+                answer = None
+                missing_information = []
+                used_memory_ids = []
+                supporting_source_ids = []
+                contributing_agent_ids = []
+
+                if not reasoning:
+                    reasoning = (
+                        "The model declined to answer the request."
+                    )
+            elif cls.is_abstention_answer(answer):
+                status = "insufficient_evidence"
+                answer = None
+
+                if not reasoning:
+                    reasoning = (
+                        "The model did not identify sufficient accessible "
+                        "evidence to answer the task."
+                    )
+
+                if not missing_information:
+                    missing_information = [
+                        _LEGACY_MISSING_INFORMATION
+                    ]
+            else:
+                status = "answered"
+
+                if not reasoning:
+                    reasoning = (
+                        "The model returned an answer without an explicit "
+                        "supporting explanation."
+                    )
+
+        normalized.update(
+            {
+                "schema_version": cls.normalize_schema_version(
+                    data.get("schema_version")
+                ),
+                "status": status,
+                "answer": answer,
+                "reasoning": reasoning,
+                "confidence": cls.clamp_confidence(
+                    data.get("confidence")
+                ),
+                "missing_information": missing_information,
+                "used_memory_ids": used_memory_ids,
+                "supporting_source_ids": supporting_source_ids,
+                "contributing_agent_ids": contributing_agent_ids,
+            }
+        )
+
+        # Remove only documented v1 aliases. Unknown fields are intentionally
+        # preserved so AgentAnswer(extra="forbid") can reject them.
+        normalized.pop("final_answer", None)
+        normalized.pop("evidence_chunk_ids", None)
+        normalized.pop("missing_evidence", None)
+        normalized.pop("required_information", None)
+
+        return normalized
 
     @classmethod
     def normalize_extracted_memory_dict(

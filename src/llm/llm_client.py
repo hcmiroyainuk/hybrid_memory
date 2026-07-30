@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from pathlib import Path
@@ -260,13 +261,11 @@ class LLMClient:
         apply_parser_normalization: bool = True,
     ) -> SchemaT:
         """
-        Invoke the model using any Pydantic structured-output schema.
+        Invoke the model using a Pydantic structured-output schema.
 
-        Example:
-            output = client.invoke_structured(
-                prompt,
-                AgentAnswer,
-            )
+        Raw provider output is requested whenever the installed LangChain
+        version supports it. This allows LLMOutputParser to normalize a legacy
+        or partially parsed response before final Pydantic validation.
         """
         self._validate_prompt(prompt)
         self._validate_schema_model(schema_model)
@@ -274,12 +273,12 @@ class LLMClient:
         try:
             runnable = self._get_structured_model(
                 schema_model,
-                include_raw=False,
+                include_raw=True,
             )
-            output = runnable.invoke(prompt)
+            response = runnable.invoke(prompt)
 
-            return self._parse_structured_output(
-                output=output,
+            return self._parse_structured_response(
+                response=response,
                 schema_model=schema_model,
                 apply_parser_normalization=apply_parser_normalization,
             )
@@ -299,7 +298,7 @@ class LLMClient:
         apply_parser_normalization: bool = True,
     ) -> SchemaT:
         """
-        Asynchronously invoke the model using any Pydantic schema.
+        Asynchronously invoke the model using a Pydantic schema.
         """
         self._validate_prompt(prompt)
         self._validate_schema_model(schema_model)
@@ -307,12 +306,12 @@ class LLMClient:
         try:
             runnable = self._get_structured_model(
                 schema_model,
-                include_raw=False,
+                include_raw=True,
             )
-            output = await runnable.ainvoke(prompt)
+            response = await runnable.ainvoke(prompt)
 
-            return self._parse_structured_output(
-                output=output,
+            return self._parse_structured_response(
+                response=response,
                 schema_model=schema_model,
                 apply_parser_normalization=apply_parser_normalization,
             )
@@ -335,17 +334,14 @@ class LLMClient:
         prompt_preview_chars: int = 500,
     ) -> tuple[SchemaT, LLMCallMetadata]:
         """
-        Invoke a structured-output model and return output plus metadata.
-
-        The client requests the raw provider response when supported by the
-        installed LangChain version. If raw inclusion is unavailable, output
-        parsing still works, but provider token usage may be unavailable.
+        Invoke a structured-output model and return output plus call metadata.
         """
         self._validate_prompt(prompt)
         self._validate_schema_model(schema_model)
         agent_id = self._validate_identifier(agent_id, "agent_id")
 
         started_at = perf_counter()
+        response: Any = None
 
         try:
             runnable = self._get_structured_model(
@@ -354,26 +350,30 @@ class LLMClient:
             )
             response = runnable.invoke(prompt)
 
-            parsed_output, raw_response = self._split_structured_response(
-                response
-            )
-
-            output = self._parse_structured_output(
-                output=parsed_output,
+            output = self._parse_structured_response(
+                response=response,
                 schema_model=schema_model,
                 apply_parser_normalization=apply_parser_normalization,
             )
 
             latency_ms = (perf_counter() - started_at) * 1000.0
-            input_tokens, output_tokens = self._extract_token_usage(
+            raw_response = self._raw_response_for_metadata(response)
+            usage_response = (
                 raw_response
+                if raw_response is not None
+                else response
+            )
+            input_tokens, output_tokens = self._extract_token_usage(
+                usage_response
             )
 
             metadata = self._build_metadata(
                 agent_id=agent_id,
                 role=role,
                 prompt=prompt,
-                raw_output=self._serialise_raw_output(raw_response),
+                raw_output=self._serialise_raw_output(
+                    usage_response
+                ),
                 success=True,
                 error_message=None,
                 latency_ms=latency_ms,
@@ -383,19 +383,31 @@ class LLMClient:
             )
 
             return output, metadata
+
         except Exception as error:
             latency_ms = (perf_counter() - started_at) * 1000.0
+            raw_response = self._raw_response_for_metadata(response)
+            usage_response = (
+                raw_response
+                if raw_response is not None
+                else response
+            )
+            input_tokens, output_tokens = self._extract_token_usage(
+                usage_response
+            )
 
             metadata = self._build_metadata(
                 agent_id=agent_id,
                 role=role,
                 prompt=prompt,
-                raw_output=None,
+                raw_output=self._serialise_raw_output(
+                    usage_response
+                ),
                 success=False,
                 error_message=str(error),
                 latency_ms=latency_ms,
-                input_tokens=None,
-                output_tokens=None,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
                 prompt_preview_chars=prompt_preview_chars,
             )
 
@@ -423,6 +435,7 @@ class LLMClient:
         agent_id = self._validate_identifier(agent_id, "agent_id")
 
         started_at = perf_counter()
+        response: Any = None
 
         try:
             runnable = self._get_structured_model(
@@ -431,26 +444,30 @@ class LLMClient:
             )
             response = await runnable.ainvoke(prompt)
 
-            parsed_output, raw_response = self._split_structured_response(
-                response
-            )
-
-            output = self._parse_structured_output(
-                output=parsed_output,
+            output = self._parse_structured_response(
+                response=response,
                 schema_model=schema_model,
                 apply_parser_normalization=apply_parser_normalization,
             )
 
             latency_ms = (perf_counter() - started_at) * 1000.0
-            input_tokens, output_tokens = self._extract_token_usage(
+            raw_response = self._raw_response_for_metadata(response)
+            usage_response = (
                 raw_response
+                if raw_response is not None
+                else response
+            )
+            input_tokens, output_tokens = self._extract_token_usage(
+                usage_response
             )
 
             metadata = self._build_metadata(
                 agent_id=agent_id,
                 role=role,
                 prompt=prompt,
-                raw_output=self._serialise_raw_output(raw_response),
+                raw_output=self._serialise_raw_output(
+                    usage_response
+                ),
                 success=True,
                 error_message=None,
                 latency_ms=latency_ms,
@@ -460,19 +477,31 @@ class LLMClient:
             )
 
             return output, metadata
+
         except Exception as error:
             latency_ms = (perf_counter() - started_at) * 1000.0
+            raw_response = self._raw_response_for_metadata(response)
+            usage_response = (
+                raw_response
+                if raw_response is not None
+                else response
+            )
+            input_tokens, output_tokens = self._extract_token_usage(
+                usage_response
+            )
 
             metadata = self._build_metadata(
                 agent_id=agent_id,
                 role=role,
                 prompt=prompt,
-                raw_output=None,
+                raw_output=self._serialise_raw_output(
+                    usage_response
+                ),
                 success=False,
                 error_message=str(error),
                 latency_ms=latency_ms,
-                input_tokens=None,
-                output_tokens=None,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
                 prompt_preview_chars=prompt_preview_chars,
             )
 
@@ -513,8 +542,9 @@ class LLMClient:
                 include_raw=include_raw,
             )
         except TypeError:
-            # Compatibility fallback for versions that do not expose
-            # include_raw in with_structured_output.
+            # Compatibility fallback for LangChain versions that do not expose
+            # include_raw. In that case the provider-parsed result is returned
+            # directly and raw fallback parsing may be unavailable.
             runnable = self.chat_model.with_structured_output(
                 schema_model
             )
@@ -523,33 +553,90 @@ class LLMClient:
         return runnable
 
     @classmethod
-    def _parse_structured_output(
+    def _parse_structured_response(
         cls,
         *,
-        output: Any,
+        response: Any,
         schema_model: type[SchemaT],
         apply_parser_normalization: bool,
     ) -> SchemaT:
-        if output is None:
-            raise LLMOutputParseError(
-                f"Structured output for {schema_model.__name__} is None."
+        """
+        Parse a LangChain structured-output response.
+
+        Preferred path:
+            provider/LangChain parsed output -> LLMOutputParser -> schema
+
+        Recovery path:
+            raw provider content -> LLMOutputParser -> schema
+
+        The recovery path is important for AgentAnswer v2 because provider-side
+        Pydantic parsing can fail before the project parser has an opportunity
+        to migrate a legacy AgentAnswer v1 response.
+        """
+        parsed_output, raw_response, provider_error = (
+            cls._unpack_structured_response(response)
+        )
+
+        errors: list[str] = []
+
+        if parsed_output is not None:
+            try:
+                return LLMOutputParser.parse_as(
+                    parsed_output,
+                    schema_model,
+                    apply_default_normalizer=(
+                        apply_parser_normalization
+                    ),
+                )
+            except LLMOutputParseError as error:
+                errors.append(
+                    f"parsed-output validation failed: {error}"
+                )
+
+        fallback_candidate = cls._structured_fallback_candidate(
+            raw_response
+        )
+
+        if fallback_candidate is not None:
+            try:
+                return LLMOutputParser.parse_as(
+                    fallback_candidate,
+                    schema_model,
+                    apply_default_normalizer=(
+                        apply_parser_normalization
+                    ),
+                )
+            except LLMOutputParseError as error:
+                errors.append(
+                    f"raw-output fallback failed: {error}"
+                )
+
+        if provider_error is not None:
+            errors.insert(
+                0,
+                f"provider parsing failed: {provider_error}",
             )
 
-        return LLMOutputParser.parse_as(
-            output,
-            schema_model,
-            apply_default_normalizer=apply_parser_normalization,
+        if not errors:
+            errors.append(
+                "the structured response contained neither a parsed result "
+                "nor usable raw content"
+            )
+
+        raise LLMOutputParseError(
+            f"Failed to parse structured output for "
+            f"{schema_model.__name__}: "
+            + " | ".join(errors)
         )
 
     @staticmethod
-    def _split_structured_response(
+    def _unpack_structured_response(
         response: Any,
-    ) -> tuple[Any, Any]:
+    ) -> tuple[Any, Any, Any]:
         """
-        Split LangChain include_raw output into parsed and raw components.
+        Return (parsed, raw, parsing_error) from an include_raw response.
 
-        When include_raw is unsupported, the response itself is treated as the
-        parsed output and raw metadata is unavailable.
+        A non-wrapper response is treated as a directly parsed output.
         """
         if isinstance(response, Mapping):
             has_structured_wrapper = (
@@ -559,26 +646,77 @@ class LLMClient:
             )
 
             if has_structured_wrapper:
-                parsing_error = response.get("parsing_error")
+                return (
+                    response.get("parsed"),
+                    response.get("raw"),
+                    response.get("parsing_error"),
+                )
 
-                if parsing_error:
-                    raise LLMOutputParseError(
-                        f"Structured-output parsing failed: "
-                        f"{parsing_error}"
-                    )
+        return response, None, None
 
-                parsed = response.get("parsed")
-                raw = response.get("raw")
+    @classmethod
+    def _structured_fallback_candidate(
+        cls,
+        raw_response: Any,
+    ) -> Any | None:
+        """
+        Extract content that LLMOutputParser can parse from a raw response.
+        """
+        if raw_response is None:
+            return None
 
-                if parsed is None:
-                    raise LLMOutputParseError(
-                        "Structured-output wrapper did not contain "
-                        "a parsed result."
-                    )
+        content = getattr(raw_response, "content", None)
 
-                return parsed, raw
+        if content is None and isinstance(raw_response, Mapping):
+            content = raw_response.get(
+                "content",
+                raw_response.get("text"),
+            )
 
-        return response, None
+        if isinstance(content, Mapping):
+            if "text" not in content and "content" not in content:
+                return dict(content)
+
+            content = content.get(
+                "text",
+                content.get("content"),
+            )
+
+        if content is not None:
+            text = cls._extract_text_from_content(content)
+            if text:
+                return text
+
+        if isinstance(raw_response, str):
+            text = raw_response.strip()
+            return text or None
+
+        if isinstance(raw_response, Mapping):
+            return dict(raw_response)
+
+        if isinstance(raw_response, BaseModel):
+            return raw_response.model_dump()
+
+        text = str(raw_response).strip()
+        return text or None
+
+    @classmethod
+    def _raw_response_for_metadata(
+        cls,
+        response: Any,
+    ) -> Any:
+        if response is None:
+            return None
+
+        _, raw_response, _ = cls._unpack_structured_response(
+            response
+        )
+
+        return (
+            raw_response
+            if raw_response is not None
+            else response
+        )
 
     # ------------------------------------------------------------------
     # Text and metadata helpers
@@ -707,6 +845,32 @@ class LLMClient:
     ) -> str | None:
         if response is None:
             return None
+
+        if isinstance(response, BaseModel):
+            try:
+                return response.model_dump_json()
+            except Exception:
+                return str(response).strip() or None
+
+        if isinstance(response, Mapping):
+            try:
+                return json.dumps(
+                    dict(response),
+                    ensure_ascii=False,
+                    default=str,
+                )
+            except (TypeError, ValueError):
+                return str(response).strip() or None
+
+        if isinstance(response, (list, tuple)):
+            try:
+                return json.dumps(
+                    response,
+                    ensure_ascii=False,
+                    default=str,
+                )
+            except (TypeError, ValueError):
+                return str(response).strip() or None
 
         try:
             return cls._extract_text(response)
