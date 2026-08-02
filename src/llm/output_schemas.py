@@ -396,6 +396,442 @@ class MemoryReviewOutput(BaseModel):
         return _clean_string_list(value)
 
 
+class MemoryAccessDecisionOutput(BaseModel):
+    """
+    Structured decision describing the initial access policy
+    assigned to an existing memory.
+
+    This schema only represents the decision. It does not modify
+    MemoryMetadata or persist any access-policy changes.
+    """
+
+    memory_id: str = Field(
+        description=(
+            "ID of the memory to which the access policy applies."
+        )
+    )
+
+    target_scope: Literal[
+        "private",
+        "shared",
+    ] = Field(
+        description=(
+            "Visibility scope to assign to the memory."
+        )
+    )
+
+    allowed_agent_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Additional non-owner agents allowed to read the memory "
+            "when target_scope is 'shared'. Use ['*'] for global "
+            "read access. The memory owner is added automatically "
+            "by the access-policy service."
+        ),
+    )
+
+    review_required: bool = Field(
+        default=False,
+        description=(
+            "Whether the proposed access policy requires additional "
+            "review before it is applied."
+        ),
+    )
+
+    reason: str = Field(
+        description=(
+            "Brief explanation for the proposed access policy."
+        )
+    )
+
+    confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Confidence in the access-policy decision."
+        ),
+    )
+
+    @field_validator(
+        "memory_id",
+        "reason",
+    )
+    @classmethod
+    def required_text_must_not_be_empty(
+        cls,
+        value: str,
+    ) -> str:
+        cleaned = str(value).strip()
+
+        if not cleaned:
+            raise ValueError(
+                "Required access-decision fields cannot be empty."
+            )
+
+        return cleaned
+
+    @field_validator(
+        "allowed_agent_ids",
+    )
+    @classmethod
+    def clean_allowed_agent_ids(
+        cls,
+        value: list[str],
+    ) -> list[str]:
+        return _clean_string_list(value)
+
+    @model_validator(mode="after")
+    def validate_access_policy(
+        self,
+    ) -> "MemoryAccessDecisionOutput":
+        if (
+            self.target_scope == "private"
+            and self.allowed_agent_ids
+        ):
+            raise ValueError(
+                "allowed_agent_ids must be empty when "
+                "target_scope='private'."
+            )
+
+        if (
+            self.target_scope == "shared"
+            and not self.allowed_agent_ids
+        ):
+            raise ValueError(
+                "A shared access policy must specify at least "
+                "one allowed agent ID or the '*' wildcard."
+            )
+
+        if (
+            "*" in self.allowed_agent_ids
+            and len(self.allowed_agent_ids) > 1
+        ):
+            raise ValueError(
+                "The '*' wildcard cannot be combined with "
+                "specific agent IDs."
+            )
+
+        return self
+
+
+class MemoryAccessReviewOutput(BaseModel):
+    """
+    Structured Critic review of a proposed initial memory-access policy.
+
+    This output is advisory. The Coordinator retains final authority and the
+    review itself must not modify the persisted memory ACL.
+    """
+
+    memory_id: str = Field(
+        description="ID of the memory whose proposed access policy was reviewed."
+    )
+
+    recommendation: Literal[
+        "approve",
+        "revise",
+        "reject",
+    ] = Field(
+        description=(
+            "Critic recommendation for the proposed policy. "
+            "'approve' accepts it, 'revise' proposes a safer alternative, "
+            "and 'reject' recommends owner-only private access."
+        )
+    )
+
+    policy_compliant: bool = Field(
+        description="Whether the proposed policy complies with the active governance policy."
+    )
+
+    least_privilege_satisfied: bool = Field(
+        description=(
+            "Whether the proposed readers are limited to the minimum set "
+            "required by the current task or policy."
+        )
+    )
+
+    risk_labels: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Compact risk labels identified during review, such as "
+            "'sensitive_content', 'over_sharing', or 'unknown_reader'."
+        ),
+    )
+
+    suggested_scope: Literal[
+        "private",
+        "shared",
+    ] = Field(
+        description="Scope recommended by the Critic after review."
+    )
+
+    suggested_agent_ids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Additional non-owner readers recommended when "
+            "suggested_scope='shared'. Use ['*'] only for global access."
+        ),
+    )
+
+    reason: str = Field(
+        description="Brief explanation of the Critic's recommendation."
+    )
+
+    confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score between 0.0 and 1.0.",
+    )
+
+    @field_validator(
+        "memory_id",
+        "reason",
+    )
+    @classmethod
+    def required_review_text_must_not_be_empty(
+        cls,
+        value: str,
+    ) -> str:
+        cleaned = str(value).strip()
+
+        if not cleaned:
+            raise ValueError(
+                "Required memory-access review fields cannot be empty."
+            )
+
+        return cleaned
+
+    @field_validator(
+        "risk_labels",
+        "suggested_agent_ids",
+    )
+    @classmethod
+    def clean_review_lists(
+        cls,
+        value: list[str],
+    ) -> list[str]:
+        return _clean_string_list(value)
+
+    @model_validator(mode="after")
+    def validate_suggested_policy(
+        self,
+    ) -> "MemoryAccessReviewOutput":
+        if (
+            self.suggested_scope == "private"
+            and self.suggested_agent_ids
+        ):
+            raise ValueError(
+                "suggested_agent_ids must be empty when "
+                "suggested_scope='private'."
+            )
+
+        if (
+            self.suggested_scope == "shared"
+            and not self.suggested_agent_ids
+        ):
+            raise ValueError(
+                "A shared suggested policy must specify at least "
+                "one Agent ID or the '*' wildcard."
+            )
+
+        if (
+            "*" in self.suggested_agent_ids
+            and len(self.suggested_agent_ids) > 1
+        ):
+            raise ValueError(
+                "The '*' wildcard cannot be combined with specific "
+                "Agent IDs."
+            )
+
+        if self.recommendation == "reject":
+            if self.suggested_scope != "private":
+                raise ValueError(
+                    "A rejected initial policy must recommend "
+                    "suggested_scope='private'."
+                )
+
+            if self.suggested_agent_ids:
+                raise ValueError(
+                    "A rejected initial policy cannot recommend "
+                    "additional readers."
+                )
+
+        return self
+
+
+class MemoryAccessRequestDecisionOutput(BaseModel):
+    """
+    Structured Coordinator decision for a runtime memory-access request.
+
+    This object records what should happen. MemorySharingGateway performs the
+    actual approve or reject operation.
+    """
+
+    request_id: str = Field(
+        description="ID of the access request being evaluated."
+    )
+
+    memory_id: str = Field(
+        description="ID of the memory referenced by the request."
+    )
+
+    approved: bool = Field(
+        description="Whether the Coordinator proposes approving the request."
+    )
+
+    review_required: bool = Field(
+        default=False,
+        description=(
+            "Whether Critic review is required before the decision "
+            "may be executed."
+        ),
+    )
+
+    reason: str = Field(
+        description="Brief explanation of the proposed access-request decision."
+    )
+
+    confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score between 0.0 and 1.0.",
+    )
+
+    @field_validator(
+        "request_id",
+        "memory_id",
+        "reason",
+    )
+    @classmethod
+    def required_request_decision_text_must_not_be_empty(
+        cls,
+        value: str,
+    ) -> str:
+        cleaned = str(value).strip()
+
+        if not cleaned:
+            raise ValueError(
+                "Required access-request decision fields cannot be empty."
+            )
+
+        return cleaned
+
+
+class MemoryAccessRequestReviewOutput(BaseModel):
+    """
+    Structured Critic review of a proposed runtime access-request decision.
+
+    The review is advisory. It does not approve, reject, or persist the
+    underlying request.
+    """
+
+    request_id: str = Field(
+        description="ID of the access request being reviewed."
+    )
+
+    memory_id: str = Field(
+        description="ID of the memory referenced by the request."
+    )
+
+    recommendation: Literal[
+        "approve",
+        "reject",
+    ] = Field(
+        description="Critic recommendation for the access request."
+    )
+
+    request_justified: bool = Field(
+        description=(
+            "Whether the requester supplied a sufficiently specific and "
+            "task-relevant reason for access."
+        )
+    )
+
+    policy_compliant: bool = Field(
+        description="Whether granting the request would comply with the active policy."
+    )
+
+    least_privilege_satisfied: bool = Field(
+        description=(
+            "Whether granting this request is consistent with least-privilege "
+            "access rather than unnecessary broad sharing."
+        )
+    )
+
+    risk_labels: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Compact risk labels identified during review, such as "
+            "'insufficient_reason', 'sensitive_content', or 'role_mismatch'."
+        ),
+    )
+
+    reason: str = Field(
+        description="Brief explanation of the Critic's recommendation."
+    )
+
+    confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score between 0.0 and 1.0.",
+    )
+
+    @field_validator(
+        "request_id",
+        "memory_id",
+        "reason",
+    )
+    @classmethod
+    def required_request_review_text_must_not_be_empty(
+        cls,
+        value: str,
+    ) -> str:
+        cleaned = str(value).strip()
+
+        if not cleaned:
+            raise ValueError(
+                "Required access-request review fields cannot be empty."
+            )
+
+        return cleaned
+
+    @field_validator("risk_labels")
+    @classmethod
+    def clean_request_review_risk_labels(
+        cls,
+        value: list[str],
+    ) -> list[str]:
+        return _clean_string_list(value)
+
+    @model_validator(mode="after")
+    def validate_request_recommendation(
+        self,
+    ) -> "MemoryAccessRequestReviewOutput":
+        if self.recommendation == "approve":
+            if not self.request_justified:
+                raise ValueError(
+                    "An approved recommendation requires "
+                    "request_justified=True."
+                )
+
+            if not self.policy_compliant:
+                raise ValueError(
+                    "An approved recommendation requires "
+                    "policy_compliant=True."
+                )
+
+            if not self.least_privilege_satisfied:
+                raise ValueError(
+                    "An approved recommendation requires "
+                    "least_privilege_satisfied=True."
+                )
+
+        return self
+
+
 class TaskRoutingOutput(BaseModel):
     """
     Structured routing decision produced for a multi-agent task.

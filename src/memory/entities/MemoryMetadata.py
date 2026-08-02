@@ -156,20 +156,51 @@ class MemoryMetadata(BaseModel):
 
     @classmethod
     def shared(
-        cls,
-        owner_agent_id: str,
-        created_by_agent_id: str,
-        writable_by: Optional[list[str]] = None,
-        **kwargs
+            cls,
+            owner_agent_id: str,
+            created_by_agent_id: str,
+            readable_by: Optional[list[str]] = None,
+            writable_by: Optional[list[str]] = None,
+            **kwargs,
     ) -> "MemoryMetadata":
         """
-        Create default metadata for shared memory.
+        Create metadata for a shared memory.
+
+        Shared memory does not imply global access. The permitted readers
+        must be provided explicitly. The owner always retains read and
+        write access.
+
+        Pass readable_by=["*"] only when the memory should be globally
+        readable.
         """
+        requested_readers = readable_by or []
+
+        if "*" in requested_readers:
+            final_readable_by = ["*"]
+        else:
+            final_readable_by = list(
+                dict.fromkeys(
+                    [
+                        owner_agent_id,
+                        *requested_readers,
+                    ]
+                )
+            )
+
+        final_writable_by = list(
+            dict.fromkeys(
+                [
+                    owner_agent_id,
+                    *(writable_by or []),
+                ]
+            )
+        )
+
         return cls(
             owner_agent_id=owner_agent_id,
             created_by_agent_id=created_by_agent_id,
             scope=MemoryScope.SHARED,
-            readable_by=["*"],
-            writable_by=writable_by or [owner_agent_id],
-            **kwargs
+            readable_by=final_readable_by,
+            writable_by=final_writable_by,
+            **kwargs,
         )

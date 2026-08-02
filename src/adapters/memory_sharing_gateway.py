@@ -49,23 +49,37 @@ class MemorySharingGateway(Protocol):
         ...
 
     def approve_request(
-        self,
-        *,
-        coordinator_agent_id: str,
-        request_id: str,
-        comment: str | None = None,
+            self,
+            *,
+            coordinator_agent_id: str,
+            request_id: str,
+            comment: str | None = None,
+            require_critic_review: bool = True,
     ) -> MemoryAccessDecisionResult:
-        """Approve a governed request after Critic review."""
+        """
+        Approve an access request.
+
+        When require_critic_review is True, the request must have
+        completed Critic review before Coordinator approval.
+
+        When False, the Coordinator may approve the request directly.
+        """
         ...
 
     def approve_direct_request(
-        self,
-        *,
-        coordinator_agent_id: str,
-        request_id: str,
-        comment: str | None = None,
+            self,
+            *,
+            coordinator_agent_id: str,
+            request_id: str,
+            comment: str | None = None,
     ) -> MemoryAccessDecisionResult:
-        """Directly approve an ungoverned request without Critic review."""
+        """
+        Approve an access request without requiring prior Critic review.
+
+        This method is retained as a compatibility shortcut. New workflow
+        code may call approve_request(..., require_critic_review=False)
+        directly.
+        """
         ...
 
     def reject_request(

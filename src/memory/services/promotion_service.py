@@ -27,21 +27,14 @@ class AgentProtocol(Protocol):
 @runtime_checkable
 class MemoryStoreProtocol(Protocol):
     """
-    Persistence interface required from the project's MemoryStore.
+    Read-only memory access required by PromotionService.
 
-    The concrete JSON-backed MemoryStore exposes ``get_by_id`` and
-    ``replace`` rather than generic ``get`` and ``save`` methods.
+    ACL persistence is owned by MemoryAccessPolicyService.
     """
 
     def get_by_id(
         self,
         memory_id: str,
-    ) -> Any:
-        ...
-
-    def replace(
-        self,
-        memory: Any,
     ) -> Any:
         ...
 
@@ -60,6 +53,27 @@ class PromotionRequestStoreProtocol(Protocol):
     ) -> PromotionRequest:
         ...
 
+
+@runtime_checkable
+class MemoryAccessPolicyServiceProtocol(
+    Protocol
+):
+    """
+    Access-policy operations required by PromotionService.
+
+    PromotionService manages request state, while the access-policy
+    service is the only component allowed to modify memory ACLs.
+    """
+
+    def grant_read_access(
+        self,
+        *,
+        governance_actor: AgentProtocol,
+        memory_id: str,
+        agent_ids: list[str],
+        reason: str | None = None,
+    ) -> Any:
+        ...
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -123,13 +137,19 @@ class PromotionService:
     """
 
     def __init__(
-        self,
-        *,
-        memory_store: MemoryStoreProtocol,
-        request_store: PromotionRequestStoreProtocol,
+            self,
+            *,
+            memory_store: MemoryStoreProtocol,
+            request_store: PromotionRequestStoreProtocol,
+            access_policy_service: (
+                    MemoryAccessPolicyServiceProtocol
+            ),
     ) -> None:
         self.memory_store = memory_store
         self.request_store = request_store
+        self.access_policy_service = (
+            access_policy_service
+        )
 
     # ------------------------------------------------------------------
     # Request submission
@@ -230,20 +250,18 @@ class PromotionService:
     # ------------------------------------------------------------------
 
     def approve_promotion_request(
-        self,
-        *,
-        coordinator: AgentProtocol,
-        request_id: str,
-        comment: str | None = None,
-        require_critic_review: bool = True,
+            self,
+            *,
+            coordinator: AgentProtocol,
+            request_id: str,
+            comment: str | None = None,
+            require_critic_review: bool = True,
     ) -> PromotionRequest:
         """
-        Approve a request and persistently grant access.
+        Approve an access request and grant the requester read access.
 
-        For governed mode, keep ``require_critic_review=True``.
-
-        For the ungoverned baseline, use
-        ``require_critic_review=False``.
+        PromotionService manages the request lifecycle. All memory ACL
+        changes are delegated to MemoryAccessPolicyService.
         """
         self._require_role(
             coordinator,
@@ -254,16 +272,24 @@ class PromotionService:
             request_id
         )
 
-        # Work on a copy so the stored object is not mutated before the
-        # memory update succeeds.
-        approved_request = current_request.model_copy(
-            deep=True
+        # Preserve the original request so it can be restored if the
+        # access-policy operation fails.
+        original_request = (
+            current_request.model_copy(
+                deep=True
+            )
+        )
+
+        approved_request = (
+            current_request.model_copy(
+                deep=True
+            )
         )
 
         try:
             approved_request.approve(
-                coordinator_agent_id=self._agent_id(
-                    coordinator
+                coordinator_agent_id=(
+                    self._agent_id(coordinator)
                 ),
                 comment=comment,
                 require_critic_review=(
@@ -275,48 +301,71 @@ class PromotionService:
                 str(error)
             ) from error
 
-        original_memory = self._get_memory(
+        memory = self._get_memory(
             approved_request.memory_id
         )
 
         self._validate_request_against_memory(
             request=approved_request,
-            memory=original_memory,
+            memory=memory,
         )
 
-        updated_memory = (
-            self._promote_and_grant_access(
-                memory=original_memory,
-                requester_agent_id=(
-                    approved_request.requester_agent_id
-                ),
+        # Persist the approved request first. If the subsequent ACL
+        # operation fails, restore the original request state.
+        try:
+            saved_request = (
+                self.request_store.save(
+                    approved_request
+                )
             )
-        )
-
-        # Save memory first. If saving the request fails, attempt to
-        # restore the previous memory state.
-        self.memory_store.replace(updated_memory)
+        except Exception as error:
+            raise PromotionServiceError(
+                "Failed to persist the approved "
+                "access request."
+            ) from error
 
         try:
-            return self.request_store.save(
-                approved_request
+            (
+                self.access_policy_service
+                .grant_read_access(
+                    governance_actor=coordinator,
+                    memory_id=(
+                        saved_request.memory_id
+                    ),
+                    agent_ids=[
+                        saved_request
+                        .requester_agent_id
+                    ],
+                    reason=(
+                            comment
+                            or (
+                                "Access granted through "
+                                f"request "
+                                f"{saved_request.request_id}."
+                            )
+                    ),
+                )
             )
         except Exception as error:
             try:
-                self.memory_store.replace(
-                    original_memory
+                self.request_store.save(
+                    original_request
                 )
             except Exception as rollback_error:
                 raise PromotionServiceError(
-                    "Saving the approved request failed, "
-                    "and memory rollback also failed: "
+                    "Granting memory access failed, "
+                    "and restoring the original "
+                    "request state also failed: "
                     f"{rollback_error}"
                 ) from error
 
             raise PromotionServiceError(
-                "Saving the approved request failed. "
-                "The memory update was rolled back."
+                "Granting memory access failed. "
+                "The access request was restored "
+                "to its previous state."
             ) from error
+
+        return saved_request
 
     def approve_ungoverned_request(
         self,
@@ -404,69 +453,6 @@ class PromotionService:
     # ------------------------------------------------------------------
     # Memory update
     # ------------------------------------------------------------------
-
-    def _promote_and_grant_access(
-        self,
-        *,
-        memory: Any,
-        requester_agent_id: str,
-    ) -> Any:
-        """
-        Return an updated memory with:
-
-        - scope set to shared;
-        - the owner preserved;
-        - the requester added to readable_by;
-        - all existing readers preserved.
-        """
-        memory_id = self._required_memory_text(
-            memory,
-            "memory_id",
-        )
-        owner_id = self._required_memory_text(
-            memory,
-            "owner_agent_id",
-        )
-
-        requester_id = str(
-            requester_agent_id
-        ).strip()
-
-        if not requester_id:
-            raise PromotionServiceError(
-                "requester_agent_id cannot be empty."
-            )
-
-        readers = self._clean_string_list(
-            self._read_memory_field(
-                memory,
-                "readable_by",
-                [],
-            )
-        )
-
-        for required_reader in (
-            owner_id,
-            requester_id,
-        ):
-            if required_reader not in readers:
-                readers.append(required_reader)
-
-        updates = {
-            "scope": "shared",
-            "readable_by": readers,
-        }
-
-        try:
-            return self._copy_memory_with_updates(
-                memory,
-                updates,
-            )
-        except Exception as error:
-            raise PromotionServiceError(
-                "Failed to promote memory "
-                f"{memory_id!r}: {error}"
-            ) from error
 
     def _validate_request_against_memory(
         self,
@@ -767,102 +753,3 @@ class PromotionService:
 
         return result
 
-    @staticmethod
-    def _copy_memory_with_updates(
-        memory: Any,
-        updates: dict[str, Any],
-    ) -> Any:
-        """
-        Return a copied MemoryItem with governance metadata updated.
-
-        MemoryItem stores ``scope``, ``owner_agent_id``, ``readable_by`` and
-        other access-control fields inside ``metadata`` rather than at the
-        MemoryItem top level.
-        """
-        if isinstance(memory, BaseModel):
-            data = memory.model_dump(
-                mode="python"
-            )
-            metadata = dict(
-                data.get(
-                    "metadata",
-                    {}
-                )
-            )
-            metadata.update(
-                updates
-            )
-            data[
-                "metadata"
-            ] = metadata
-
-            return memory.__class__.model_validate(
-                data
-            )
-
-        if isinstance(memory, Mapping):
-            result = deepcopy(
-                dict(memory)
-            )
-            metadata_value = result.get(
-                "metadata",
-                {}
-            )
-
-            if isinstance(
-                metadata_value,
-                Mapping,
-            ):
-                metadata = dict(
-                    metadata_value
-                )
-                metadata.update(
-                    updates
-                )
-                result[
-                    "metadata"
-                ] = metadata
-                return result
-
-            metadata = deepcopy(
-                metadata_value
-            )
-
-            for field_name, value in (
-                updates.items()
-            ):
-                setattr(
-                    metadata,
-                    field_name,
-                    value,
-                )
-
-            result[
-                "metadata"
-            ] = metadata
-            return result
-
-        result = deepcopy(
-            memory
-        )
-        metadata = getattr(
-            result,
-            "metadata",
-            None,
-        )
-
-        if metadata is None:
-            raise PromotionServiceError(
-                "Memory is missing governance metadata."
-            )
-
-        for field_name, value in (
-            updates.items()
-        ):
-            setattr(
-                metadata,
-                field_name,
-                value,
-            )
-
-        return result

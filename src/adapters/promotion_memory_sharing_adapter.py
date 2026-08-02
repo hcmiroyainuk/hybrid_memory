@@ -143,24 +143,42 @@ class PromotionMemorySharingAdapter(MemorySharingGateway):
         return self._to_request_result(request)
 
     def approve_request(
-        self,
-        *,
-        coordinator_agent_id: str,
-        request_id: str,
-        comment: str | None = None,
+            self,
+            *,
+            coordinator_agent_id: str,
+            request_id: str,
+            comment: str | None = None,
+            require_critic_review: bool = True,
     ) -> MemoryAccessDecisionResult:
-        coordinator = self._get_agent(coordinator_agent_id)
+        """
+        Approve an access request, optionally requiring prior Critic review.
+        """
+        coordinator = self._get_agent(
+            coordinator_agent_id
+        )
 
         request = self._call_service(
-            lambda: self._promotion_service.approve_promotion_request(
-                coordinator=coordinator,
-                request_id=self._required_text(request_id, "request_id"),
-                comment=self._optional_text(comment),
-                require_critic_review=True,
+            lambda: (
+                self._promotion_service
+                .approve_promotion_request(
+                    coordinator=coordinator,
+                    request_id=self._required_text(
+                        request_id,
+                        "request_id",
+                    ),
+                    comment=self._optional_text(
+                        comment
+                    ),
+                    require_critic_review=(
+                        bool(require_critic_review)
+                    ),
+                )
             )
         )
 
-        return self._to_decision_result(request)
+        return self._to_decision_result(
+            request
+        )
 
     def approve_direct_request(
         self,

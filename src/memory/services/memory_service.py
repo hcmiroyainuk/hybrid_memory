@@ -105,38 +105,53 @@ class MemoryService:
         return created_memory
 
     def create_shared_memory(
-        self,
-        agent: Agent,
-        content: str,
-        summary: Optional[str] = None,
-        memory_type: MemoryType | str = MemoryType.NOTE,
-        tags: Optional[list[str]] = None,
-        importance: float = 0.5,
-        confidence: float = 1.0,
-        source_task_id: Optional[str] = None,
-        source_message_ids: Optional[list[str]] = None,
-        source_type: SourceType | str = SourceType.AGENT_OUTPUT,
-        reason: Optional[str] = None,
+            self,
+            agent: Agent,
+            content: str,
+            summary: Optional[str] = None,
+            memory_type: MemoryType | str = MemoryType.NOTE,
+            tags: Optional[list[str]] = None,
+            importance: float = 0.5,
+            confidence: float = 1.0,
+            source_task_id: Optional[str] = None,
+            source_message_ids: Optional[list[str]] = None,
+            source_type: SourceType | str = SourceType.AGENT_OUTPUT,
+            readable_by: Optional[list[str]] = None,
+            writable_by: Optional[list[str]] = None,
+            reason: Optional[str] = None,
     ) -> MemoryItem:
         """
-        Directly create a shared memory.
+        Directly create a shared memory owned by the acting agent.
 
-        Baseline rule:
-        - Only coordinator can directly create shared memory.
+        This method is intended for system-level shared memories directly
+        created by an authorised agent. Persona-owned memories should
+        normally be created privately and governed through
+        MemoryAccessPolicyService.
         """
-
-        self.permission_service.assert_can_create_shared_memory(agent)
+        self.permission_service.assert_can_create_shared_memory(
+            agent
+        )
 
         metadata = MemoryMetadata.shared(
             owner_agent_id=agent.agent_id,
             created_by_agent_id=agent.agent_id,
-            writable_by=[agent.agent_id],
+            readable_by=(
+                ["*"]
+                if readable_by is None
+                else readable_by
+            ),
+            writable_by=(
+                    writable_by
+                    or [agent.agent_id]
+            ),
             memory_type=MemoryType(memory_type),
             tags=tags or [],
             importance=importance,
             confidence=confidence,
             source_task_id=source_task_id,
-            source_message_ids=source_message_ids or [],
+            source_message_ids=(
+                    source_message_ids or []
+            ),
             source_type=SourceType(source_type),
         )
 
@@ -146,7 +161,9 @@ class MemoryService:
             metadata=metadata,
         )
 
-        created_memory = self.memory_store.create(memory)
+        created_memory = self.memory_store.create(
+            memory
+        )
 
         record = self._record_memory_created(
             memory=created_memory,
@@ -155,9 +172,11 @@ class MemoryService:
         )
 
         if record is not None:
-            created_memory = self._attach_operation_to_memory(
-                memory=created_memory,
-                operation_id=record.record_id,
+            created_memory = (
+                self._attach_operation_to_memory(
+                    memory=created_memory,
+                    operation_id=record.record_id,
+                )
             )
 
         return created_memory
