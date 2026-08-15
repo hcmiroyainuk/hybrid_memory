@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+from uuid import uuid4
 from pathlib import Path
 from typing import Optional
 
@@ -200,27 +200,43 @@ class MemoryRetriever:
             k=min(top_k, len(documents)),
         )
 
-    def _build_vector_store(self, documents):
+    def _build_vector_store(
+            self,
+            documents,
+    ):
         """
-        Build a Chroma vector store from documents.
+        Build an isolated Chroma vector store for one retrieval call.
 
-        For the current baseline, this is rebuilt per retrieval call using
-        only accessible memories.
+        A unique collection name prevents memories from different
+        sample-mode runtimes or previous retrieval calls from being mixed.
         """
+        unique_collection_name = (
+            f"{self.collection_name}_{uuid4().hex}"
+        )
+
         if self.persist_directory:
-            self.persist_directory.mkdir(parents=True, exist_ok=True)
+            self.persist_directory.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
 
             return Chroma.from_documents(
                 documents=documents,
                 embedding=self.embeddings,
-                collection_name=self.collection_name,
-                persist_directory=str(self.persist_directory),
+                collection_name=(
+                    unique_collection_name
+                ),
+                persist_directory=str(
+                    self.persist_directory
+                ),
             )
 
         return Chroma.from_documents(
             documents=documents,
             embedding=self.embeddings,
-            collection_name=self.collection_name,
+            collection_name=(
+                unique_collection_name
+            ),
         )
 
     def _documents_to_memories(self, documents) -> list[MemoryItem]:

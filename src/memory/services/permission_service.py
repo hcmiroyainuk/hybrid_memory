@@ -10,19 +10,26 @@ from ..entities import (
 
 
 class PermissionDeniedError(Exception):
-    """Raised when an agent does not have permission to perform an operation."""
+    """Raised when an agent is not allowed to perform a memory operation."""
 
 
 class PermissionService:
     """
-    Centralised permission services for memory governance.
+    Centralised permission checks for governed multi-agent memory.
 
-    This services only checks whether an agent is allowed to perform an action.
-    It does not modify memories, requests, or logs.
+    Governance rules enforced by this service:
+    - A Worker may create, read, and update only its own private memories.
+    - A private memory is owner-only, even if its ACL is accidentally broader.
+    - Shared memories are readable only when both the Agent role permission and
+      the memory-level ``readable_by`` ACL allow access.
+    - Only a Coordinator may directly create or update shared memories.
+    - Only the Worker that owns an active private memory may submit it for
+      promotion.
+    - Only a Critic may review a promotion request and provide a recommendation.
+    - Only a Coordinator may approve or reject promotion and resolve conflicts.
 
-    Permission model:
-    - Role-level permission: defined by Agent.role and Agent permission flags.
-    - Object-level permission: defined by MemoryMetadata.readable_by / writable_by.
+    This service performs validation only. It does not mutate memories,
+    promotion requests, or operation logs.
     """
 
     # ------------------------------------------------------------------
@@ -32,30 +39,37 @@ class PermissionService:
     @staticmethod
     def can_read_memory(agent: Agent, memory: MemoryItem) -> bool:
         """
-        Check whether an agent can read a memory.
+        Return whether ``agent`` may read ``memory`` in the normal workflow.
 
-        Rules:
-        - Shared memory can be read by agents with shared-read permission.
-        - Private memory can only be read if the memory explicitly allows it.
-        - Deprecated memories are not considered readable in normal workflow.
+        Deprecated memories are excluded from normal reads. Private memories
+        are strictly owner-only. Shared memories require both role-level and
+        object-level permission.
         """
 
         if memory.metadata.status == MemoryStatus.DEPRECATED:
             return False
 
-        if memory.metadata.scope == MemoryScope.SHARED:
-            return agent.can_read_shared and memory.can_be_read_by(agent.agent_id)
-
         if memory.metadata.scope == MemoryScope.PRIVATE:
-            return memory.can_be_read_by(agent.agent_id)
+            return (
+                agent.role == AgentRole.WORKER
+                and memory.metadata.owner_agent_id == agent.agent_id
+                and memory.can_be_read_by(agent.agent_id)
+            )
+
+        if memory.metadata.scope == MemoryScope.SHARED:
+            return (
+                agent.can_read_shared
+                and memory.can_be_read_by(agent.agent_id)
+            )
 
         return False
 
     @staticmethod
-    def assert_can_read_memory(agent: Agent, memory: MemoryItem) -> None:
-        """
-        Raise PermissionDeniedError if the agent cannot read the memory.
-        """
+    def assert_can_read_memory(
+        agent: Agent,
+        memory: MemoryItem,
+    ) -> None:
+        """Raise ``PermissionDeniedError`` when the memory is not readable."""
 
         if not PermissionService.can_read_memory(agent, memory):
             raise PermissionDeniedError(
@@ -70,37 +84,39 @@ class PermissionService:
     @staticmethod
     def can_write_memory(agent: Agent, memory: MemoryItem) -> bool:
         """
-        Check whether an agent can update a memory.
+        Return whether ``agent`` may update ``memory``.
 
-        Rules:
-        - Shared memory can only be directly written by agents with shared-write permission.
-        - Private memory can only be written by agents with private-write permission
-          and object-level write access.
-        - Deprecated memories should not be updated in normal workflow.
+        Workers may update only their own active private memories. Shared
+        memory updates are restricted to a Coordinator that also passes the
+        memory-level ``writable_by`` ACL.
         """
 
         if memory.metadata.status == MemoryStatus.DEPRECATED:
             return False
 
-        if memory.metadata.scope == MemoryScope.SHARED:
+        if memory.metadata.scope == MemoryScope.PRIVATE:
             return (
-                agent.can_write_shared
+                agent.role == AgentRole.WORKER
+                and agent.can_write_private
+                and memory.metadata.owner_agent_id == agent.agent_id
                 and memory.can_be_written_by(agent.agent_id)
             )
 
-        if memory.metadata.scope == MemoryScope.PRIVATE:
+        if memory.metadata.scope == MemoryScope.SHARED:
             return (
-                agent.can_write_private
+                agent.role == AgentRole.COORDINATOR
+                and agent.can_write_shared
                 and memory.can_be_written_by(agent.agent_id)
             )
 
         return False
 
     @staticmethod
-    def assert_can_write_memory(agent: Agent, memory: MemoryItem) -> None:
-        """
-        Raise PermissionDeniedError if the agent cannot write the memory.
-        """
+    def assert_can_write_memory(
+        agent: Agent,
+        memory: MemoryItem,
+    ) -> None:
+        """Raise ``PermissionDeniedError`` when the memory is not writable."""
 
         if not PermissionService.can_write_memory(agent, memory):
             raise PermissionDeniedError(
@@ -114,35 +130,27 @@ class PermissionService:
 
     @staticmethod
     def can_create_private_memory(agent: Agent) -> bool:
-        """
-        Check whether an agent can create private memory.
+        """Return whether the Agent may create a private memory for itself."""
 
-        Baseline rule:
-        - Worker, critic, and coordinator can all create their own private memories
-          if can_write_private is True.
-        """
-
-        return agent.can_write_private
+        return (
+            agent.role == AgentRole.WORKER
+            and agent.can_write_private
+        )
 
     @staticmethod
     def assert_can_create_private_memory(agent: Agent) -> None:
-        """
-        Raise PermissionDeniedError if the agent cannot create private memory.
-        """
+        """Raise when the Agent may not create private memory."""
 
         if not PermissionService.can_create_private_memory(agent):
             raise PermissionDeniedError(
-                f"Agent '{agent.agent_id}' is not allowed to create private memory."
+                f"Agent '{agent.agent_id}' is not allowed to create "
+                "private memory. Only Workers with private-write "
+                "permission may create private memories."
             )
 
     @staticmethod
     def can_create_shared_memory(agent: Agent) -> bool:
-        """
-        Check whether an agent can directly create shared memory.
-
-        Baseline rule:
-        - Only coordinator can directly create shared memory.
-        """
+        """Return whether the Agent may directly create shared memory."""
 
         return (
             agent.role == AgentRole.COORDINATOR
@@ -151,13 +159,12 @@ class PermissionService:
 
     @staticmethod
     def assert_can_create_shared_memory(agent: Agent) -> None:
-        """
-        Raise PermissionDeniedError if the agent cannot create shared memory.
-        """
+        """Raise when the Agent may not directly create shared memory."""
 
         if not PermissionService.can_create_shared_memory(agent):
             raise PermissionDeniedError(
-                f"Agent '{agent.agent_id}' is not allowed to create shared memory."
+                f"Agent '{agent.agent_id}' is not allowed to create "
+                "shared memory. Only the Coordinator may do so."
             )
 
     # ------------------------------------------------------------------
@@ -165,16 +172,22 @@ class PermissionService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def can_propose_promotion(agent: Agent, memory: MemoryItem) -> bool:
+    def can_propose_promotion(
+        agent: Agent,
+        memory: MemoryItem,
+    ) -> bool:
         """
-        Check whether an agent can propose a private memory for shared promotion.
+        Return whether ``agent`` may submit ``memory`` for shared promotion.
 
-        Rules:
-        - The memory must be private.
-        - The memory must be active.
-        - The proposing agent must be able to read the memory.
-        - Normally, this means the proposer is the owner of the private memory.
+        The requester must be a Worker submitting its own active private
+        memory. Object-level read and write ACLs must also remain valid.
         """
+
+        if agent.role != AgentRole.WORKER:
+            return False
+
+        if not agent.can_write_private:
+            return False
 
         if memory.metadata.scope != MemoryScope.PRIVATE:
             return False
@@ -182,57 +195,54 @@ class PermissionService:
         if memory.metadata.status != MemoryStatus.ACTIVE:
             return False
 
+        if memory.metadata.owner_agent_id != agent.agent_id:
+            return False
+
         if not memory.can_be_read_by(agent.agent_id):
+            return False
+
+        if not memory.can_be_written_by(agent.agent_id):
             return False
 
         return True
 
     @staticmethod
-    def assert_can_propose_promotion(agent: Agent, memory: MemoryItem) -> None:
-        """
-        Raise PermissionDeniedError if the agent cannot propose the memory for promotion.
-        """
+    def assert_can_propose_promotion(
+        agent: Agent,
+        memory: MemoryItem,
+    ) -> None:
+        """Raise when the Worker may not submit the promotion request."""
 
         if not PermissionService.can_propose_promotion(agent, memory):
             raise PermissionDeniedError(
                 f"Agent '{agent.agent_id}' is not allowed to propose memory "
-                f"'{memory.memory_id}' for promotion."
+                f"'{memory.memory_id}' for promotion. A Worker may submit "
+                "only its own active private memory."
             )
 
     @staticmethod
     def can_review_promotion(agent: Agent) -> bool:
-        """
-        Check whether an agent can review a promotion request.
-
-        Baseline rule:
-        - Critic and coordinator can review promotion requests.
-        """
+        """Return whether the Agent may provide a promotion recommendation."""
 
         return (
-            agent.can_review_memory
-            and agent.role in {AgentRole.CRITIC, AgentRole.COORDINATOR}
+            agent.role == AgentRole.CRITIC
+            and agent.can_review_memory
         )
 
     @staticmethod
     def assert_can_review_promotion(agent: Agent) -> None:
-        """
-        Raise PermissionDeniedError if the agent cannot review promotion requests.
-        """
+        """Raise when the Agent may not review promotion requests."""
 
         if not PermissionService.can_review_promotion(agent):
             raise PermissionDeniedError(
-                f"Agent '{agent.agent_id}' is not allowed to review promotion requests."
+                f"Agent '{agent.agent_id}' is not allowed to review "
+                "promotion requests. Only the Critic may provide the "
+                "recommendation."
             )
 
     @staticmethod
     def can_approve_promotion(agent: Agent) -> bool:
-        """
-        Check whether an agent can approve and execute memory promotion.
-
-        Baseline rule:
-        - Only coordinator can approve promotion.
-        - Critic can review but cannot approve the final shared-memory update.
-        """
+        """Return whether the Agent may make the final approval decision."""
 
         return (
             agent.role == AgentRole.COORDINATOR
@@ -242,24 +252,17 @@ class PermissionService:
 
     @staticmethod
     def assert_can_approve_promotion(agent: Agent) -> None:
-        """
-        Raise PermissionDeniedError if the agent cannot approve promotion.
-        """
+        """Raise when the Agent may not approve promotion requests."""
 
         if not PermissionService.can_approve_promotion(agent):
             raise PermissionDeniedError(
-                f"Agent '{agent.agent_id}' is not allowed to approve promotion requests."
+                f"Agent '{agent.agent_id}' is not allowed to approve "
+                "promotion requests. Only the Coordinator may approve."
             )
 
     @staticmethod
     def can_reject_promotion(agent: Agent) -> bool:
-        """
-        Check whether an agent can reject a promotion request.
-
-        Baseline rule:
-        - Only coordinator can make the final rejection decision.
-        - Critic can provide recommendation but not final rejection.
-        """
+        """Return whether the Agent may make the final rejection decision."""
 
         return (
             agent.role == AgentRole.COORDINATOR
@@ -268,13 +271,12 @@ class PermissionService:
 
     @staticmethod
     def assert_can_reject_promotion(agent: Agent) -> None:
-        """
-        Raise PermissionDeniedError if the agent cannot reject promotion.
-        """
+        """Raise when the Agent may not reject promotion requests."""
 
         if not PermissionService.can_reject_promotion(agent):
             raise PermissionDeniedError(
-                f"Agent '{agent.agent_id}' is not allowed to reject promotion requests."
+                f"Agent '{agent.agent_id}' is not allowed to reject "
+                "promotion requests. Only the Coordinator may reject."
             )
 
     # ------------------------------------------------------------------
@@ -283,37 +285,26 @@ class PermissionService:
 
     @staticmethod
     def can_detect_conflict(agent: Agent) -> bool:
-        """
-        Check whether an agent can detect or report memory conflicts.
-
-        Baseline rule:
-        - Critic and coordinator can detect/report conflicts.
-        """
+        """Return whether the Agent may detect and report a conflict."""
 
         return (
-            agent.can_review_memory
-            and agent.role in {AgentRole.CRITIC, AgentRole.COORDINATOR}
+            agent.role == AgentRole.CRITIC
+            and agent.can_review_memory
         )
 
     @staticmethod
     def assert_can_detect_conflict(agent: Agent) -> None:
-        """
-        Raise PermissionDeniedError if the agent cannot detect conflicts.
-        """
+        """Raise when the Agent may not detect or report conflicts."""
 
         if not PermissionService.can_detect_conflict(agent):
             raise PermissionDeniedError(
-                f"Agent '{agent.agent_id}' is not allowed to detect memory conflicts."
+                f"Agent '{agent.agent_id}' is not allowed to detect "
+                "memory conflicts. Only the Critic may report them."
             )
 
     @staticmethod
     def can_resolve_conflict(agent: Agent) -> bool:
-        """
-        Check whether an agent can resolve memory conflicts.
-
-        Baseline rule:
-        - Only coordinator can make final conflict resolution decisions.
-        """
+        """Return whether the Agent may make a final conflict decision."""
 
         return (
             agent.role == AgentRole.COORDINATOR
@@ -323,13 +314,13 @@ class PermissionService:
 
     @staticmethod
     def assert_can_resolve_conflict(agent: Agent) -> None:
-        """
-        Raise PermissionDeniedError if the agent cannot resolve conflicts.
-        """
+        """Raise when the Agent may not resolve conflicts."""
 
         if not PermissionService.can_resolve_conflict(agent):
             raise PermissionDeniedError(
-                f"Agent '{agent.agent_id}' is not allowed to resolve memory conflicts."
+                f"Agent '{agent.agent_id}' is not allowed to resolve "
+                "memory conflicts. Only the Coordinator may decide the "
+                "resolution."
             )
 
     # ------------------------------------------------------------------
@@ -338,22 +329,21 @@ class PermissionService:
 
     @staticmethod
     def can_retrieve_shared_memory(agent: Agent) -> bool:
-        """
-        Check whether an agent can retrieve shared memories.
-        """
+        """Return whether the Agent may participate in shared retrieval."""
 
         return agent.can_read_shared
 
     @staticmethod
-    def can_retrieve_private_memory(agent: Agent, owner_agent_id: str) -> bool:
-        """
-        Check whether an agent can retrieve private memories owned by owner_agent_id.
+    def can_retrieve_private_memory(
+        agent: Agent,
+        owner_agent_id: str,
+    ) -> bool:
+        """Return whether the Worker may retrieve the owner's private memory."""
 
-        Baseline rule:
-        - Private memory can only be retrieved by its owner.
-        """
-
-        return agent.agent_id == owner_agent_id
+        return (
+            agent.role == AgentRole.WORKER
+            and agent.agent_id == owner_agent_id
+        )
 
     # ------------------------------------------------------------------
     # Generic operation helper
@@ -365,48 +355,47 @@ class PermissionService:
         operation: str,
         memory: MemoryItem | None = None,
     ) -> bool:
-        """
-        Generic operation dispatcher.
+        """Dispatch a named permission check to the corresponding rule."""
 
-        This is useful when services layer wants to check permission by operation name.
-        """
+        normalized_operation = operation.strip().lower()
 
-        operation = operation.lower()
-
-        if operation == "create_private":
+        if normalized_operation == "create_private":
             return PermissionService.can_create_private_memory(agent)
 
-        if operation == "create_shared":
+        if normalized_operation == "create_shared":
             return PermissionService.can_create_shared_memory(agent)
 
-        if operation == "read":
-            if memory is None:
-                return False
-            return PermissionService.can_read_memory(agent, memory)
+        if normalized_operation == "read":
+            return (
+                memory is not None
+                and PermissionService.can_read_memory(agent, memory)
+            )
 
-        if operation == "write":
-            if memory is None:
-                return False
-            return PermissionService.can_write_memory(agent, memory)
+        if normalized_operation == "write":
+            return (
+                memory is not None
+                and PermissionService.can_write_memory(agent, memory)
+            )
 
-        if operation == "propose_promotion":
-            if memory is None:
-                return False
-            return PermissionService.can_propose_promotion(agent, memory)
+        if normalized_operation == "propose_promotion":
+            return (
+                memory is not None
+                and PermissionService.can_propose_promotion(agent, memory)
+            )
 
-        if operation == "review_promotion":
+        if normalized_operation == "review_promotion":
             return PermissionService.can_review_promotion(agent)
 
-        if operation == "approve_promotion":
+        if normalized_operation == "approve_promotion":
             return PermissionService.can_approve_promotion(agent)
 
-        if operation == "reject_promotion":
+        if normalized_operation == "reject_promotion":
             return PermissionService.can_reject_promotion(agent)
 
-        if operation == "detect_conflict":
+        if normalized_operation == "detect_conflict":
             return PermissionService.can_detect_conflict(agent)
 
-        if operation == "resolve_conflict":
+        if normalized_operation == "resolve_conflict":
             return PermissionService.can_resolve_conflict(agent)
 
         return False

@@ -54,13 +54,15 @@ class MemoryItem(BaseModel):
         return agent_id in self.metadata.writable_by
 
     def mark_deprecated(self, operation_id: Optional[str] = None) -> None:
-        self.metadata.status = "deprecated"
+        # self.metadata.status = "deprecated"
+        self.metadata.status = MemoryMetadata.status.DEPRECATED
         if operation_id:
             self.metadata.last_operation_id = operation_id
             self.metadata.related_operation_ids.append(operation_id)
 
     def mark_conflicting(self, operation_id: Optional[str] = None) -> None:
-        self.metadata.status = "conflicting"
+        # self.metadata.status = "conflicting"
+        self.metadata.status = MemoryMetadata.status.CONFLICTING
         if operation_id:
             self.metadata.last_operation_id = operation_id
             self.metadata.related_operation_ids.append(operation_id)
