@@ -539,6 +539,56 @@ class LLMOutputParser:
         normalized.pop("missing_evidence", None)
         normalized.pop("required_information", None)
 
+        status = normalized.get("status")
+
+        if status == "answered":
+            answer = cls.normalize_optional_text(
+                normalized.get("answer")
+            )
+
+            if answer is not None:
+                normalized["answer"] = answer
+                normalized["missing_information"] = []
+            else:
+                normalized["status"] = (
+                    "insufficient_evidence"
+                )
+                normalized["answer"] = None
+                normalized["missing_information"] = [
+                    (
+                        "Sufficient authorised evidence "
+                        "to produce an answer."
+                    )
+                ]
+
+        elif status == "insufficient_evidence":
+            normalized["answer"] = None
+
+            missing_information = (
+                cls.normalize_string_list(
+                    normalized.get(
+                        "missing_information"
+                    )
+                )
+            )
+
+            normalized["missing_information"] = (
+                    missing_information
+                    or [
+                        (
+                            "Sufficient authorised evidence "
+                            "to answer the request."
+                        )
+                    ]
+            )
+
+        elif status == "refused":
+            normalized["answer"] = None
+            normalized["missing_information"] = []
+            normalized["used_memory_ids"] = []
+            normalized["supporting_source_ids"] = []
+            normalized["contributing_agent_ids"] = []
+
         return normalized
 
     @classmethod

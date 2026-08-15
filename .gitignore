@@ -24,3 +24,4 @@ data/logs.jsonl
 
 # Jupyter
 .ipynb_checkpoints/
+/scripts/

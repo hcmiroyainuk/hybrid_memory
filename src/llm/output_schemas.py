@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Literal
 
 from pydantic import (
@@ -162,6 +163,70 @@ class AgentAnswer(BaseModel):
             raise TypeError("Identifier and information fields must be lists.")
 
         return _clean_string_list(value)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalise_status_dependent_fields(
+            cls,
+            value: Any,
+    ) -> Any:
+        """
+        Canonicalise harmless status-dependent field inconsistencies
+        before strict AgentAnswer validation.
+
+        This keeps the final schema contract strict while preventing
+        provider-side structured-output parsing from failing because the
+        model populated fields that are irrelevant to the selected status.
+        """
+        if not isinstance(value, Mapping):
+            return value
+
+        data = dict(value)
+
+        status = str(
+            data.get("status") or ""
+        ).strip().lower()
+
+        answer_text = str(
+            data.get("answer") or ""
+        ).strip()
+
+        if status == "answered":
+            # A concrete answered result does not have missing information.
+            if answer_text:
+                data["missing_information"] = []
+
+        elif status == "insufficient_evidence":
+            data["answer"] = None
+
+            missing_information = data.get(
+                "missing_information"
+            )
+
+            if not isinstance(
+                    missing_information,
+                    list,
+            ) or not any(
+                str(item or "").strip()
+                for item in missing_information
+            ):
+                data["missing_information"] = [
+                    "Relevant authorised information"
+                ]
+
+            # Non-answer results must not claim evidence usage.
+            data["used_memory_ids"] = []
+            data["supporting_source_ids"] = []
+            data["contributing_agent_ids"] = []
+
+        elif status == "refused":
+            data["answer"] = None
+            data["missing_information"] = []
+            data["used_memory_ids"] = []
+            data["supporting_source_ids"] = []
+            data["contributing_agent_ids"] = []
+
+        return data
 
     @model_validator(mode="after")
     def validate_status_contract(self) -> "AgentAnswer":
